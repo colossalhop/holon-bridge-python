@@ -49,7 +49,7 @@
 #>
 
 param(
-    [string]$RepoPath      = "C:\ProgramData\jena-bridge-python",
+    [string]$RepoPath      = "C:\ProgramData\holon-bridge-python",
     [string]$VenvFolder    = ".venv",
     [string]$McpNgrokUrl   = "kurtcagle-mcp-python.ngrok.io",
     [string]$RestNgrokUrl  = "",

@@ -15,6 +15,7 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI
 
+from .acting_as import ActingAsStore
 from .config import BankStore, Settings, get_settings
 from .fuseki import FusekiClient
 from .cache import RegistryCache
@@ -57,6 +58,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # rather than as MCP-layer module state like the dataset/bank
         # overrides.
         application.state.personas = PersonaStore()
+        # Admin act_as impersonation state -- see acting_as.py. Same
+        # per-process, held-on-app.state shape as personas above, but
+        # deliberately not persisted to disk: a restart should always
+        # come back to "acting as no one."
+        application.state.acting_as = ActingAsStore()
         # Strong references to background runs. asyncio holds only a weak one,
         # so an unheld task can be collected mid-flight and the run just stops.
         application.state.tasks = set()
@@ -125,7 +131,31 @@ app = create_app()
 
 
 def main() -> None:  # pragma: no cover
+    import logging
     import uvicorn
+
+    # Nothing in this codebase ever called logging.basicConfig() (or set up
+    # any handler/level for the holonbridge.* logger hierarchy), so every
+    # logging.getLogger(__name__).info(...)/warning(...) call anywhere in
+    # this package -- including named_rules.py's own "REPLACE-TRACE"
+    # diagnostic logging around the known write_mode=Replace issue -- was
+    # silently invisible in a real server run under Python's default root
+    # logger level (WARNING, no handler). Confirmed empirically: 301 real
+    # Replace-mode firings against a live instance produced zero
+    # REPLACE-TRACE lines in server output, including the always-
+    # unconditional baseline trace line that has no conditional gating it.
+    # This means the existing trace instrumentation -- added specifically
+    # to catch this bug -- likely never actually surfaced in a real
+    # deployment's logs either. Configurable via HOLONBRIDGE_LOG_LEVEL
+    # rather than hardcoded, so an operator can dial it without a code
+    # change; defaults to INFO so REPLACE-TRACE and similar diagnostic
+    # logging is visible out of the box, matching what a reader of
+    # named_rules.py's own docstring would reasonably assume was already
+    # happening.
+    logging.basicConfig(
+        level=os.environ.get("HOLONBRIDGE_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
 
     settings = get_settings()
     uvicorn.run(

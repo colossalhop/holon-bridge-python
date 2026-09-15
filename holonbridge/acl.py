@@ -1,7 +1,7 @@
 """Access control: resolve who is asking, decide what they may do.
 
-Implements the model documented in the ACL architecture DataBook
-(``causalspark-acl-architecture.databook.md``) against whatever is actually
+Implements the model documented in the ACL architecture design record
+against whatever is actually
 in a dataset's ``holons`` graph -- Person, Role, Persona, and grant
 instances. Nothing here is dataset-specific; it queries the model, it
 doesn't assume its contents.

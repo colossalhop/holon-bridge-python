@@ -6,10 +6,10 @@ it can't live there: those overrides are process-global because "which
 backend/dataset" isn't a per-caller question for a single-operator MCP
 process forwarding one login. "Which persona is this person currently
 reading as" *is* per-caller -- two credentials reaching this same bridge
-process each carry their own persona, and neither may move the other (see
-test_identity_threading.py -- the remote transport already carries more
-than one real login through one process, e.g. kurtcagle alongside
-ctownley-cs, so this isn't a hypothetical). Only the REST bridge has the
+process each carry their own persona, and neither may move the other --
+the remote transport already carries more than one real login through
+one process at once, so this isn't a hypothetical. Only the REST bridge
+has the
 identity to key that by: it resolves Animus.person per request via
 require_animus; the MCP layer never sees more than a login name it
 forwards in a header.

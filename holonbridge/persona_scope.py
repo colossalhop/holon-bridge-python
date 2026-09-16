@@ -18,7 +18,7 @@ ordered composition of `Conn`'s methods.
 
 FIXED 2026-08-17: `resolve_scope_graphs` was calling
 `conn.persona_user_graph(persona, role, person_id)` directly with
-`person_id` as a full Person IRI (e.g. `urn:causalspark:person:kurt`).
+`person_id` as a full Person IRI (e.g. `urn:example:person:kurt`).
 `persona_user_graph`'s `user` argument is a short local slug ("kurt"),
 and its own validation rejects colons -- a full Person IRI is full of
 them, so this raised `ValueError` on every real call, never exercised

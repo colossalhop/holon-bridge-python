@@ -16,6 +16,23 @@ docstring), and a second, independently-written write path is exactly how
 that class of gap reappears. There is now one function that decides whether
 a write is allowed and validated; every route that writes Turtle into a
 named graph calls it.
+
+CHANGED 2026-09-15: closed a validate-then-write TOCTOU flagged by Ben
+Wortley. The SHACL gate (``shacl_mod.validate_full``/``validate_delta``)
+takes its own snapshot of the target graph, has real ``await`` points
+while it does, and only the GSP write afterwards actually commits — with
+nothing in between stopping a second concurrent call from validating
+against the same stale snapshot and landing a jointly-invalid write (or,
+under ``mode="replace"``, simply clobbering the first write's GSP PUT
+outright). The SHACL round trip and the final write are now serialised
+per target dataset via ``write_lock.for_conn`` — see that module's
+docstring for why a lock, not a single atomic Jena operation, is the right
+fix here: unlike PR #14's Replace-mode fix, there is no single SPARQL
+UPDATE that could make "validate against Fuseki, then GSP PUT/POST" one
+Jena transaction. The ACL check itself stays outside the lock: it is a
+plain read with no write-then-confirm shape, so serialising it buys
+nothing and would only add latency ahead of the lock for every caller,
+including ones that end up 403'd before ever touching SHACL.
 """
 
 from __future__ import annotations
@@ -25,6 +42,7 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from . import shacl as shacl_mod
+from . import write_lock
 from .acl import Animus, check_replace, check_write
 from .conn import Conn
 from .fuseki import FusekiClient, FusekiError
@@ -57,6 +75,12 @@ async def write_turtle_to_graph(
     create_message always passes ``"merge"`` (events are append-only; see
     ``routes/events.py``), create_holon and push_turtle both expose the
     caller's choice.
+
+    The SHACL-validate-then-write sequence below runs under a per-
+    (bank, dataset) lock (see ``write_lock``) so two concurrent calls
+    against the same target can never have their validation windows
+    overlap. The ACL decision above is deliberately made before the lock
+    is taken — see the module docstring.
     """
     if animus.person is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="unresolved identity")
@@ -82,48 +106,49 @@ async def write_turtle_to_graph(
     if resolved_shapes_graph is None and shacl_required:
         resolved_shapes_graph = conn.shapes_graph
 
-    report_payload = None
-    if resolved_shapes_graph:
+    async with write_lock.for_conn(conn):
+        report_payload = None
+        if resolved_shapes_graph:
+            try:
+                if shacl_delta:
+                    report = await shacl_mod.validate_delta(
+                        client,
+                        conn,
+                        turtle=turtle,
+                        shapes_graph=resolved_shapes_graph,
+                        target_graph=graph_iri,
+                        write_mode=mode,
+                        reduction_rule_id=reduction_rule_id,
+                    )
+                else:
+                    report = await shacl_mod.validate_full(
+                        client,
+                        conn,
+                        turtle=turtle,
+                        shapes_graph=resolved_shapes_graph,
+                        target_graph=graph_iri,
+                        write_mode=mode,
+                        reduction_rule_id=reduction_rule_id,
+                    )
+            except ValueError as exc:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+            except FusekiError as exc:
+                raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
+
+            report_payload = report.as_dict()
+            if not report.conforms:
+                raise HTTPException(
+                    422,
+                    detail={"error": "shacl_violation", **report_payload},
+                )
+
         try:
-            if shacl_delta:
-                report = await shacl_mod.validate_delta(
-                    client,
-                    conn,
-                    turtle=turtle,
-                    shapes_graph=resolved_shapes_graph,
-                    target_graph=graph_iri,
-                    write_mode=mode,
-                    reduction_rule_id=reduction_rule_id,
-                )
+            if mode == "replace":
+                await client.put_graph(conn, graph_iri, turtle)
             else:
-                report = await shacl_mod.validate_full(
-                    client,
-                    conn,
-                    turtle=turtle,
-                    shapes_graph=resolved_shapes_graph,
-                    target_graph=graph_iri,
-                    write_mode=mode,
-                    reduction_rule_id=reduction_rule_id,
-                )
-        except ValueError as exc:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+                await client.post_graph(conn, graph_iri, turtle)
         except FusekiError as exc:
             raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
-
-        report_payload = report.as_dict()
-        if not report.conforms:
-            raise HTTPException(
-                422,
-                detail={"error": "shacl_violation", **report_payload},
-            )
-
-    try:
-        if mode == "replace":
-            await client.put_graph(conn, graph_iri, turtle)
-        else:
-            await client.post_graph(conn, graph_iri, turtle)
-    except FusekiError as exc:
-        raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
 
     return {
         "ok": True,

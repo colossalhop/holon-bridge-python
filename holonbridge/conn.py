@@ -16,7 +16,7 @@ onto the new convention, which as of 2026-07-29 is every dataset except
 worldtest.
 
 CHANGED 2026-08-15: added persona_user_graph / persona_graph /
-persona_for_graph. The Aimee/Carlo proof-of-concept needed a graph per
+persona_for_graph. An early two-persona proof-of-concept needed a graph per
 (persona, role, user) -- one level deeper than ``scoped`` goes -- and it
 was built by hand against a live dataset before this method existed to
 build it correctly. These three methods are that convention made into
@@ -26,7 +26,7 @@ like this.
 
 CHANGED 2026-08-17: added person_slug. persona_user_graph's ``user``
 argument is a short local slug (``"kurt"``), and its own validation
-rejects colons -- which a resolved Person IRI (``urn:causalspark:person:
+rejects colons -- which a resolved Person IRI (``urn:example:person:
 kurt``, what Animus.person actually holds) is full of. Every caller
 sitting on Animus.person needs this derivation before it can name that
 person's persona-user graph; centralised here for the same reason the
@@ -174,7 +174,7 @@ class Conn:
 
     def persona_graph(self, persona: str) -> str:
         """The org-tier ``holon:Persona`` resource IRI itself, e.g.
-        ``urn:{dataset}:persona:aimee`` -- distinct from
+        ``urn:{dataset}:persona:assistant`` -- distinct from
         ``persona_user_graph``, which names a *graph*, not this holon."""
         if not persona or any(ch in persona for ch in _IRI_UNSAFE + ":"):
             raise ValueError(f"persona {persona!r} cannot be used in a graph IRI")
@@ -200,7 +200,7 @@ class Conn:
     def person_slug(person_iri: str) -> str:
         """The local user-slug segment of a Person IRI -- what
         ``persona_user_graph``'s ``user`` argument actually expects, e.g.
-        ``urn:causalspark:person:kurt`` -> ``"kurt"``. A full Person IRI is
+        ``urn:example:person:kurt`` -> ``"kurt"``. A full Person IRI is
         never itself a valid ``user`` argument: it contains colons, which
         ``persona_user_graph``'s own validation rejects. Takes the
         trailing colon-separated segment regardless of bank-scoping -- a

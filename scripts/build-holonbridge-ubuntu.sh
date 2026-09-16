@@ -40,8 +40,8 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 MIN_PY_MINOR=10   # pyproject.toml requires-python = ">=3.10"
 
 # Matches the repo's own documented default (mcp,dev). shacl is added here
-# because SHACL_REQUIRED/SHACL_DELTA are live on Kurt's actual deployments
-# (causalspark, vm-fuseki) — override with HOLONBRIDGE_EXTRAS if not wanted.
+# because SHACL_REQUIRED/SHACL_DELTA are live on real deployments of this
+# bridge — override with HOLONBRIDGE_EXTRAS if not wanted.
 HOLONBRIDGE_EXTRAS="${HOLONBRIDGE_EXTRAS:-mcp,shacl,dev}"
 
 RESET_VENV="false"
@@ -198,11 +198,13 @@ Still manual, by design:
     GITHUB_OAUTH_CLIENT_ID/SECRET, MCP_PUBLIC_URL, MCP_JWT_SECRET,
     MCP_INBOUND_TOKEN, MCP_ALLOWED_GITHUB_LOGINS — see README.md >
     "GitHub OAuth, as a second credential kind" if you're doing remote MCP
-  - ngrok: the checked-in authtoken in scripts/holonbridge-ctl.sh should be
-    rotated and removed from git history before you rely on this build,
-    then re-added locally with 'ngrok config add-authtoken <new-token>'
-    (out of scope for this script deliberately — it's a credential, not a
-    build step)
+  - ngrok: scripts/holonbridge-ctl.sh's git history contains an authtoken
+    that was once committed in plain text (removed from the file itself
+    on 2026-08-26, but still recoverable from history). If that token was
+    never rotated in the ngrok dashboard, treat it as live and rotate it
+    before relying on this build, then re-add the new one locally with
+    'ngrok config add-authtoken <new-token>' (out of scope for this script
+    deliberately — it's a credential, not a build step)
 
 Next:
   cd $INSTALL_DIR

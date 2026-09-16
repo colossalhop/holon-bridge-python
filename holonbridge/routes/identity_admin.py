@@ -7,7 +7,7 @@ switch_persona, which is self-service and membership-gated. Creating a
 new Person or minting someone else's Home is never something a caller
 does to themselves the first time -- there is no bootstrap path around
 that, matching how every Person creation so far in this codebase (the
-8/17 sweep, the same-day aimee mint on 2026-08-25) has been an admin
+8/17 sweep, the same-day persona mint on 2026-08-25) has been an admin
 operation performed on someone's behalf, not a self-registration flow.
 
 Person metadata beyond the identity-resolution essentials (full name,
@@ -170,7 +170,7 @@ async def create_person(
 
 class AssignPersonaRequest(BaseModel):
     person: str = Field(..., min_length=1, description="Full Person IRI.")
-    persona: str = Field(..., min_length=1, description="Local persona name, e.g. 'aimee'.")
+    persona: str = Field(..., min_length=1, description="Local persona name, e.g. 'assistant'.")
     label: str = Field(default="Home", description="rdfs:label for the Home holon.")
 
 
@@ -225,7 +225,7 @@ class ActAsRequest(BaseModel):
     target: str = Field(
         ..., min_length=1,
         description="Person to impersonate: either a short local slug "
-        "(e.g. 'ctownley-cs'), resolved via conn.person_iri() the same "
+        "(e.g. 'jane-doe'), resolved via conn.person_iri() the same "
         "way create_person's own slug is, or a full Person IRI.",
     )
 

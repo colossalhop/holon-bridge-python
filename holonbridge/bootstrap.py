@@ -6,8 +6,8 @@ Person to exist for the caller's identity before it will do anything. On a
 genuinely fresh dataset -- no Person minted yet, not even the operator's
 own -- there is no route through the REST API that can create that first
 Person: the gate that would authorise the write is the very thing not yet
-satisfied. Confirmed live (2026-08-26) against a fresh ``causalspark``
-dataset on vm-fuseki: ``push_turtle`` itself came back 401 ("no Person
+satisfied. Confirmed live (2026-08-26) against a fresh ``example``
+dataset: ``push_turtle`` itself came back 401 ("no Person
 found for GitHubIdentity identifier ..."), same as every other route --
 the bootstrap bypass that unblocked it that day was a raw SPARQL UPDATE
 run directly against Fuseki, outside holon-bridge-python entirely.

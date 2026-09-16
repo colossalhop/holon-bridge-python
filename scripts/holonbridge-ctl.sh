@@ -78,7 +78,7 @@ BOOTSTRAP_ADMIN_BANK="${BOOTSTRAP_ADMIN_BANK:-local}"
 # first, then HOLONBRIDGE_DIR/.env) — never hardcoded here. See the header
 # note above if a token was previously committed in this file.
 NGROK_AUTHTOKEN="${NGROK_AUTHTOKEN:-}"
-NGROK_URL="${NGROK_URL:-https://causalspark.ngrok.io}"
+NGROK_URL="${NGROK_URL:-https://your-subdomain.ngrok.io}"
 NGROK_LOCAL_PORT="${NGROK_LOCAL_PORT:-3034}"
 
 RUN_DIR="${RUN_DIR:-$HOME/.holonbridge/run}"

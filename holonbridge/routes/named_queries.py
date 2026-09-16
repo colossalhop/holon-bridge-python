@@ -21,7 +21,7 @@ a query outside their reachable set gets the same 404 shape as an unknown
 id, so a restricted tool never differentially confirms its own existence
 to someone who can't reach it.
 
-``personas.get()`` returns a short persona name ("carlo"), the same shape
+``personas.get()`` returns a short persona name ("advisor"), the same shape
 ``resolve_reachable`` itself takes (see toolset.py). ``bind_persona_param``
 needs the full Persona IRI instead — converted once, right before that
 call, via ``conn.persona_graph`` — since it has no ``Conn`` to convert

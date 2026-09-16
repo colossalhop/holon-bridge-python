@@ -62,7 +62,7 @@ async def list_personas() -> dict:
 async def act_as(target: str) -> dict:
     """Admin-only testing tool: make every subsequent call on your
     credential resolve as ``target`` (a short Person slug, e.g.
-    'ctownley-cs', or a full Person IRI) instead of yourself.
+    'jane-doe', or a full Person IRI) instead of yourself.
 
     The point is to exercise the real, non-bypassed ACL/grant-check code
     a genuine non-admin caller would hit -- so ``target`` should be

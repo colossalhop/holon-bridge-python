@@ -16,8 +16,8 @@ an extension of it:
 
 - resolve_reachable: the hard gate. Which tool ids a persona can reach at
   all. Flat containment in ground truth, no tiering -- a Toolset is not a
-  per-person fact the way holon data is (it answers "what can Aimee do",
-  never "what can Aimee-for-Kurt-specifically do"), so this needs none of
+  per-person fact the way holon data is (it answers "what can this persona do",
+  never "what can this persona do for Kurt specifically"), so this needs none of
   persona_user_graph's per-user machinery.
 - bind_persona_param: the soft variation. Auto-binds the caller's active
   persona as a query/rule parameter, server-side only -- never accepted as
@@ -38,12 +38,12 @@ tests, not by reading the code):
 
 2. resolve_reachable's `persona` parameter was inconsistent with the rest
    of the codebase: persona.py's has_home/persona_exists both take a
-   *short* persona name ("carlo") and build the full Persona IRI
+   *short* persona name ("advisor") and build the full Persona IRI
    internally via conn.persona_graph -- exactly what PersonaStore.get()
    itself returns (confirmed live: whoami's own `persona` field is a
    short name, never a full IRI). This module's first draft expected a
    full IRI directly, which produced a syntactically-parseable but
-   semantically empty triple pattern (`<carlo> holon:hasToolset
+   semantically empty triple pattern (`<advisor> holon:hasToolset
    ?toolset`, matching nothing) whenever a route passed PersonaStore's
    own return value straight through -- caught by a route-level test
    asserting a real membership hit, not by the lower-level unit tests,
@@ -94,7 +94,7 @@ async def resolve_reachable(
     links.
 
     `persona` is the short name PersonaStore already deals in (what
-    `personas.get(...)` returns, e.g. "carlo") -- converted to the full
+    `personas.get(...)` returns, e.g. "advisor") -- converted to the full
     Persona IRI internally via `conn.persona_graph`, same as
     persona.py's `has_home`/`persona_exists` already do. A route calling
     this never needs its own conversion step.

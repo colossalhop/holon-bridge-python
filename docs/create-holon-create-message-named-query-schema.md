@@ -75,7 +75,7 @@ EOF
 {
   "ok": true,
   "graph": "https://example.org/graphs/observatories",
-  "dataset": "causalspark",
+  "dataset": "example",
   "mode": "merge",
   "validated": true,
   "validation": { "conforms": true, "mode": "delta", "violations": 0, "warnings": 0, "results": [], "report": "..." },
@@ -171,8 +171,8 @@ Same shape as `create_holon`'s, minus `mode` variability (always
 ```jsonc
 {
   "ok": true,
-  "graph": "urn:causalspark:events",
-  "dataset": "causalspark",
+  "graph": "urn:example:events",
+  "dataset": "example",
   "mode": "merge",
   "validated": false,
   "validation": null,

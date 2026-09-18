@@ -72,6 +72,10 @@ BOOTSTRAP_ADMIN_SLUG="${BOOTSTRAP_ADMIN_SLUG:-}"
 BOOTSTRAP_ADMIN_NAME="${BOOTSTRAP_ADMIN_NAME:-}"
 BOOTSTRAP_ADMIN_ROLE="${BOOTSTRAP_ADMIN_ROLE:-admin}"
 BOOTSTRAP_ADMIN_DATASET="${BOOTSTRAP_ADMIN_DATASET:-}"   # default: the bank's own dataset
+                                                          # comma-separated for more than one,
+                                                          # e.g. "hcg,crm,datavid,ggsc" -- passed
+                                                          # straight through as one --dataset value,
+                                                          # see holonbridge.bootstrap._parse_datasets
 BOOTSTRAP_ADMIN_BANK="${BOOTSTRAP_ADMIN_BANK:-local}"
 
 # ngrok tunnel for the MCP layer. NGROK_AUTHTOKEN is resolved below (env var
@@ -376,3 +380,4 @@ case "${1:-}" in
     exit 1
     ;;
 esac
+</content>

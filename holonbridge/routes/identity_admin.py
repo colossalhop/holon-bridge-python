@@ -1,8 +1,9 @@
-"""Admin identity routes: creating a Person, assigning a Persona, and
-(CHANGED 2026-09-01) admin-only session impersonation for testing.
+"""Admin identity routes: creating a Person, assigning a Persona,
+admin-only session impersonation for testing, and (CHANGED 2026-09-18)
+standalone Role/write-grant management plus Person deactivation.
 
-All four endpoints are admin-only (is_admin bypass -- the same
-break-glass capability acl.py already defines), distinct from persona.py's
+Every endpoint is admin-only (is_admin bypass -- the same break-glass
+capability acl.py already defines), distinct from persona.py's
 switch_persona, which is self-service and membership-gated. Creating a
 new Person or minting someone else's Home is never something a caller
 does to themselves the first time -- there is no bootstrap path around
@@ -35,6 +36,39 @@ that caller is currently acting as someone else. Checking ``.person``
 instead would make ``cease_acting_as`` uncallable the moment it was
 needed: the very first thing ``require_animus`` would resolve the caller
 as, mid-impersonation, is the target -- who by design isn't an admin.
+
+CHANGED 2026-09-18: create_person and assign_persona were the only way to
+*grant* anything, and there was no way to revoke, audit, or remove access
+at all short of hand-written SPARQL. This adds the missing symmetric
+half:
+
+- ``list_persons`` -- the read side. Walks Person -> external identities
+  -> Roles -> write/replace grants in one call, because an interface for
+  granting access is only half the job if there's no interface for
+  seeing what's already granted.
+- ``grant_role``/``revoke_role`` -- standalone Role assignment, after the
+  fact, for a Person create_person already minted. Both refuse to leave
+  a dataset with zero admins (see ``_sole_remaining_admin``): acl.py's
+  admin bypass has no ordinary-Role fallback under it, so a dataset with
+  no admins left has no route back in through the REST API at all --
+  only ``holonbridge-bootstrap-admin``, run by hand against Fuseki
+  directly.
+- ``grant_write``/``revoke_write`` -- the ``holon:grantsWrite``/
+  ``holon:grantsReplace`` axis acl.py's ``check_write``/``check_replace``
+  deliberately keep OUT of the Role/grants machinery (writes are never
+  role-based, on Kurt's 2026-08-17 framing) -- this was the only axis
+  create_person's own ``role`` field couldn't touch at all, at any point.
+- ``deactivate_person``/``reactivate_person`` -- "remove a user" as
+  retraction, not deletion. A Person referenced from provenance (a past
+  act_as's real_person, a scheduler firing, an authored holon) is never
+  left dangling; see ``deactivate_person``'s own docstring for the full
+  shape, and ``acl.py``'s ``resolve_person`` for the identity-resolution
+  half that actually locks the door.
+
+``revoke_role``/``revoke_write`` return ``{"ok": False, "note": ...}``
+rather than a 4xx when the thing being revoked was never held -- the same
+convention ``assign_persona`` already uses for "no such Persona"/"no
+Home here": an ordinary, expected outcome, not an error.
 """
 
 from __future__ import annotations
@@ -42,9 +76,10 @@ from __future__ import annotations
 import re
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ..acl import is_admin
+from ..conn import Conn
 from ..deps import ActingAsDep, AnimusDep, ClientDep, ConnDep
 from ..fuseki import FusekiError
 from ..persona import persona_exists
@@ -56,10 +91,23 @@ RDFS = "http://www.w3.org/2000/01/rdf-schema#"
 
 _METADATA_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
+#: The two write axes acl.py's check_write/check_replace gate on -- see
+#: their own docstrings for why holding one never implies the other.
+_GRANT_PREDICATE = {"write": "grantsWrite", "replace": "grantsReplace"}
+
 
 def _literal(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _resolve_person(conn: Conn, value: str) -> str:
+    """A Person IRI from either a short local slug or a full IRI already
+    presented as one. The exact disambiguation ``act_as``'s ``target``
+    field used inline before this existed -- centralised here now that
+    role/write grant management needs the identical rule in four more
+    places."""
+    return value if value.startswith("http") or ":" in value else conn.person_iri(value)
 
 
 async def _require_admin(conn: ConnDep, client: ClientDep, animus: AnimusDep) -> None:
@@ -75,6 +123,96 @@ async def _require_admin(conn: ConnDep, client: ClientDep, animus: AnimusDep) ->
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, detail="admin role required on this dataset"
         )
+
+
+async def _require_person_exists(query_fn, holons_graph: str, *, person: str) -> None:
+    """404s if ``person`` is not a known holon:Person -- the same guard
+    ``act_as`` already applied inline before this existed, now shared by
+    every route below that names an existing Person rather than minting
+    one. Does not check ``holon:status`` -- a deactivated Person still
+    exists and is a valid target for, say, re-granting a Role ahead of
+    reactivation; only identity resolution (acl.py's resolve_person) and
+    ``act_as`` itself treat inactive as absent."""
+    query = f"""PREFIX holon: <{HOLON}>
+ASK {{ GRAPH <{holons_graph}> {{ <{person}> a holon:Person . }} }}"""
+    result = await query_fn(query)
+    if not result.get("boolean"):
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, detail=f"no holon:Person found: {person}"
+        )
+
+
+async def _person_roles(query_fn, conn: Conn, *, person: str) -> list[dict]:
+    """Every Role ``person`` currently holds, with a label where one
+    exists. Shared by ``list_persons`` (read) and ``deactivate_person``
+    (which needs the exact set to retract)."""
+    query = f"""PREFIX holon: <{HOLON}>
+PREFIX rdfs: <{RDFS}>
+SELECT ?role ?label WHERE {{
+  GRAPH <{conn.holons_graph}> {{
+    <{person}> holon:hasRole ?role .
+    OPTIONAL {{ ?role rdfs:label ?label . }}
+  }}
+}} ORDER BY ?role"""
+    rows = (await query_fn(query)).get("results", {}).get("bindings", [])
+    return [{"role": r["role"]["value"], "label": r.get("label", {}).get("value")} for r in rows]
+
+
+async def _person_identities(query_fn, conn: Conn, *, person: str) -> list[dict]:
+    """Every external identity linked to ``person`` -- type and
+    identifier, e.g. a GitHub login."""
+    query = f"""PREFIX holon: <{HOLON}>
+SELECT ?identity ?type ?identifier WHERE {{
+  GRAPH <{conn.holons_graph}> {{
+    <{person}> holon:hasExternalIdentity ?identity .
+    ?identity a ?type ; holon:identifier ?identifier .
+  }}
+}} ORDER BY ?identity"""
+    rows = (await query_fn(query)).get("results", {}).get("bindings", [])
+    return [
+        {
+            "identity": r["identity"]["value"],
+            "type": r["type"]["value"].rsplit("/", 1)[-1],
+            "identifier": r["identifier"]["value"],
+        }
+        for r in rows
+    ]
+
+
+async def _person_write_grants(query_fn, conn: Conn, *, person: str) -> list[dict]:
+    """Every (target, mode) pair currently granting ``person`` write or
+    replace access -- the reverse lookup neither check_write nor
+    check_replace themselves need (they check one target at a time), but
+    an access review or a deactivation both do. Always lives in
+    holons_graph regardless of what ``target`` names, mirroring exactly
+    where acl.py's check_write/check_replace look for the triple."""
+    query = f"""PREFIX holon: <{HOLON}>
+SELECT ?target ?mode WHERE {{
+  GRAPH <{conn.holons_graph}> {{
+    {{ ?target holon:grantsWrite <{person}> . BIND("write" AS ?mode) }}
+    UNION
+    {{ ?target holon:grantsReplace <{person}> . BIND("replace" AS ?mode) }}
+  }}
+}} ORDER BY ?target ?mode"""
+    rows = (await query_fn(query)).get("results", {}).get("bindings", [])
+    return [{"target": r["target"]["value"], "mode": r["mode"]["value"]} for r in rows]
+
+
+async def _sole_remaining_admin(query_fn, conn: Conn, *, exclude: str) -> bool:
+    """Whether ``exclude`` is the only Person currently holding the admin
+    Role on this dataset -- the guard ``revoke_role`` and
+    ``deactivate_person`` both need before removing an admin's standing,
+    since acl.py's admin bypass has no ordinary-Role fallback beneath it."""
+    admin_role = conn.role_iri("admin")
+    query = f"""PREFIX holon: <{HOLON}>
+ASK {{
+  GRAPH <{conn.holons_graph}> {{
+    ?other holon:hasRole <{admin_role}> .
+    FILTER(?other != <{exclude}>)
+  }}
+}}"""
+    result = await query_fn(query)
+    return not result.get("boolean")
 
 
 class CreatePersonRequest(BaseModel):
@@ -251,26 +389,40 @@ async def act_as(
     identity happens to be active when this is called -- so it can never
     be chained through an existing act_as to reach a target the real
     caller couldn't reach directly.
+
+    CHANGED 2026-09-18: refuses a ``target`` carrying
+    ``holon:status "inactive"``. ``build_animus_as`` (unlike
+    ``acl.py``'s ``resolve_person``) never consults ``holon:status`` --
+    by its own docstring it isn't meant to, since the real caller's
+    identity was already fully resolved before this route runs -- so
+    without this check here, acting as a deactivated Person would
+    silently succeed where that Person's own real login no longer would.
+    Uses its own existence+status query rather than
+    ``_require_person_exists`` for exactly that reason: this is the one
+    caller that needs the stricter "exists AND active" question, not the
+    plain existence one every other route below asks.
     """
     await _require_admin(conn, client, animus)
 
-    target_iri = (
-        body.target
-        if body.target.startswith("http") or ":" in body.target
-        else conn.person_iri(body.target)
-    )
+    target_iri = _resolve_person(conn, body.target)
 
     async def query_fn(q: str) -> dict:
         return await client.select(conn, q)
 
     exists_query = f"""
     PREFIX holon: <{HOLON}>
-    ASK {{ GRAPH <{conn.holons_graph}> {{ <{target_iri}> a holon:Person }} }}
+    ASK {{
+      GRAPH <{conn.holons_graph}> {{
+        <{target_iri}> a holon:Person .
+        FILTER NOT EXISTS {{ <{target_iri}> holon:status "inactive" . }}
+      }}
+    }}
     """
     result = await query_fn(exists_query)
     if not result.get("boolean"):
         raise HTTPException(
-            status.HTTP_404_NOT_FOUND, detail=f"no holon:Person found: {target_iri}"
+            status.HTTP_404_NOT_FOUND,
+            detail=f"no active holon:Person found: {target_iri}",
         )
 
     acting_as.set(real_person=animus.real_person, target_person=target_iri)
@@ -286,3 +438,483 @@ async def cease_acting_as(
     await _require_admin(conn, client, animus)
     acting_as.clear(real_person=animus.real_person)
     return {"ok": True, "acting_as": None, "real_person": animus.real_person}
+
+
+@router.get("/persons")
+async def list_persons(conn: ConnDep, client: ClientDep, animus: AnimusDep) -> dict:
+    """Every Person known to this dataset, with their external identities,
+    roles, status, and which targets currently grant them write or
+    replace access. Answers "who can do what" in one call instead of
+    requiring hand-written SPARQL against acl.py's own model -- granting
+    access already had an interface (create_person, grant_role,
+    grant_write below); auditing it didn't, and that was the actual gap.
+
+    Admin-only, like every other route in this module. One query for the
+    Person/label/status roster, then small follow-up queries per person
+    for identities/roles/write-grants -- the same N-query shape
+    routes/persona.py's own list_personas already uses for its own
+    per-persona membership check, not a premature optimisation problem
+    until a dataset has enough Persons for it to matter.
+    """
+    await _require_admin(conn, client, animus)
+
+    async def query_fn(q: str) -> dict:
+        return await client.select(conn, q)
+
+    roster_query = f"""PREFIX holon: <{HOLON}>
+PREFIX rdfs: <{RDFS}>
+SELECT ?person ?label ?status WHERE {{
+  GRAPH <{conn.holons_graph}> {{
+    ?person a holon:Person ;
+            rdfs:label ?label .
+    OPTIONAL {{ ?person holon:status ?status . }}
+  }}
+}} ORDER BY ?person"""
+
+    try:
+        rows = (await query_fn(roster_query)).get("results", {}).get("bindings", [])
+        persons = []
+        for row in rows:
+            person = row["person"]["value"]
+            persons.append(
+                {
+                    "person": person,
+                    "label": row["label"]["value"],
+                    "status": row.get("status", {}).get("value", "active"),
+                    "external_identities": await _person_identities(
+                        query_fn, conn, person=person
+                    ),
+                    "roles": await _person_roles(query_fn, conn, person=person),
+                    "write_grants": await _person_write_grants(
+                        query_fn, conn, person=person
+                    ),
+                }
+            )
+    except FusekiError as exc:
+        raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
+
+    return {"dataset": conn.dataset, "count": len(persons), "persons": persons}
+
+
+class RoleGrantRequest(BaseModel):
+    person: str = Field(
+        ..., min_length=1,
+        description="Person to grant the role to: short local slug (e.g. 'jane-doe') "
+        "or full Person IRI.",
+    )
+    role: str = Field(..., min_length=1, description="Local role slug, e.g. 'editor'.")
+    label: str | None = Field(
+        default=None,
+        description="rdfs:label if this Role doesn't already exist. Defaults to a "
+        "title-cased version of the slug, matching create_person's own convention.",
+    )
+
+
+@router.post("/role/grant")
+async def grant_role(
+    body: RoleGrantRequest, conn: ConnDep, client: ClientDep, animus: AnimusDep
+) -> dict:
+    """Grant an existing Person a Role, standalone -- the piece
+    create_person's own inline ``role`` field couldn't cover: promoting
+    (or adding a second role to) someone who already has a Person, after
+    the fact, without hand-written SPARQL.
+
+    Idempotent the same way create_person is: re-granting a Role the
+    Person already holds is a silent no-op (GSP POST merge), not an
+    error. Mints the Role resource itself (``a holon:Role ; rdfs:label``)
+    if it doesn't already exist, exactly like create_person's own
+    ``role`` field does -- same Turtle shape, so a Role minted here is
+    indistinguishable from one minted at person-creation time.
+    """
+    await _require_admin(conn, client, animus)
+
+    person_iri = _resolve_person(conn, body.person)
+
+    async def query_fn(q: str) -> dict:
+        return await client.select(conn, q)
+
+    await _require_person_exists(query_fn, conn.holons_graph, person=person_iri)
+
+    role_iri = conn.role_iri(body.role)
+    label = body.label or body.role.replace("-", " ").title()
+
+    turtle = f"""PREFIX holon: <{HOLON}>
+PREFIX rdfs: <{RDFS}>
+
+<{role_iri}> a holon:Role ;
+    rdfs:label {_literal(label)} .
+
+<{person_iri}> holon:hasRole <{role_iri}> ."""
+
+    try:
+        await client.post_graph(conn, conn.holons_graph, turtle)
+    except FusekiError as exc:
+        raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
+
+    return {"ok": True, "person": person_iri, "role": role_iri}
+
+
+class RoleRevokeRequest(BaseModel):
+    person: str = Field(
+        ..., min_length=1,
+        description="Person to revoke the role from: short local slug or full Person IRI.",
+    )
+    role: str = Field(..., min_length=1, description="Local role slug, e.g. 'editor'.")
+
+
+@router.post("/role/revoke")
+async def revoke_role(
+    body: RoleRevokeRequest, conn: ConnDep, client: ClientDep, animus: AnimusDep
+) -> dict:
+    """Retract a Role grant -- the write side ``list_persons`` existed to
+    make visible in the first place. Removes only the ``holon:hasRole``
+    edge, never the Role resource itself (another Person may still hold
+    it) and never the Person -- see ``deactivate_person`` for removing a
+    Person's access wholesale rather than one Role at a time.
+
+    Refusing to revoke a dataset's only remaining admin is a deliberate
+    guard, not an oversight: acl.py's admin bypass is a break-glass
+    capability with no ordinary-Role fallback underneath it, so a dataset
+    with zero admins left has no route back in through the REST API at
+    all -- only ``holonbridge-bootstrap-admin``, run by hand against
+    Fuseki directly, the same chicken-and-egg bypass bootstrap.py exists
+    for. Refusing here is cheaper than needing that.
+    """
+    await _require_admin(conn, client, animus)
+
+    person_iri = _resolve_person(conn, body.person)
+    role_iri = conn.role_iri(body.role)
+
+    async def query_fn(q: str) -> dict:
+        return await client.select(conn, q)
+
+    await _require_person_exists(query_fn, conn.holons_graph, person=person_iri)
+
+    holds_role = await query_fn(
+        f"""PREFIX holon: <{HOLON}>
+ASK {{ GRAPH <{conn.holons_graph}> {{ <{person_iri}> holon:hasRole <{role_iri}> . }} }}"""
+    )
+    if not holds_role.get("boolean"):
+        return {
+            "ok": False,
+            "person": person_iri,
+            "role": role_iri,
+            "note": "not_found: this person does not currently hold that role",
+        }
+
+    if role_iri == conn.role_iri("admin") and await _sole_remaining_admin(
+        query_fn, conn, exclude=person_iri
+    ):
+        return {
+            "ok": False,
+            "person": person_iri,
+            "role": role_iri,
+            "note": "refused: this is the only Person holding the admin role on this "
+            "dataset -- revoking it would leave no route back in through the REST API",
+        }
+
+    try:
+        await client.update(
+            conn,
+            f"""PREFIX holon: <{HOLON}>
+DELETE DATA {{ GRAPH <{conn.holons_graph}> {{ <{person_iri}> holon:hasRole <{role_iri}> . }} }}""",
+        )
+    except FusekiError as exc:
+        raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
+
+    return {"ok": True, "person": person_iri, "role": role_iri, "revoked": True}
+
+
+class WriteGrantRequest(BaseModel):
+    person: str = Field(
+        ..., min_length=1,
+        description="Person to grant access to: short local slug or full Person IRI.",
+    )
+    target: str = Field(
+        ..., min_length=1,
+        description="Full IRI of the graph/resource this grant covers -- whatever "
+        "check_write/check_replace's own `target` argument means for the write this "
+        "is meant to authorise. Taken as-is; not resolved or validated against "
+        "ground truth, since the target need not exist yet.",
+    )
+    mode: str = Field(
+        default="write",
+        description="'write' (holon:grantsWrite, additive/merge) or 'replace' "
+        "(holon:grantsReplace, wholesale overwrite -- see acl.py's check_replace for "
+        "why this is a deliberately separate, stricter grant that write never implies).",
+    )
+
+    @field_validator("mode")
+    @classmethod
+    def _valid_mode(cls, value: str) -> str:
+        if value not in _GRANT_PREDICATE:
+            raise ValueError(f"mode must be one of {sorted(_GRANT_PREDICATE)}")
+        return value
+
+
+@router.post("/write/grant")
+async def grant_write(
+    body: WriteGrantRequest, conn: ConnDep, client: ClientDep, animus: AnimusDep
+) -> dict:
+    """Grant a Person explicit write (or replace) access to one target --
+    the one axis acl.py's check_write/check_replace deliberately keep OUT
+    of the Role/grants machinery above: writes are never role-based, on
+    Kurt's 2026-08-17 framing, so this is the only route that can create
+    a grantsWrite/grantsReplace edge short of hand-written SPARQL.
+
+    Idempotent: granting the same (person, target, mode) twice merges to
+    the same single triple.
+    """
+    await _require_admin(conn, client, animus)
+
+    person_iri = _resolve_person(conn, body.person)
+
+    async def query_fn(q: str) -> dict:
+        return await client.select(conn, q)
+
+    await _require_person_exists(query_fn, conn.holons_graph, person=person_iri)
+
+    predicate = _GRANT_PREDICATE[body.mode]
+    turtle = f"""PREFIX holon: <{HOLON}>
+
+<{body.target}> holon:{predicate} <{person_iri}> ."""
+
+    try:
+        await client.post_graph(conn, conn.holons_graph, turtle)
+    except FusekiError as exc:
+        raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
+
+    return {"ok": True, "person": person_iri, "target": body.target, "mode": body.mode}
+
+
+class WriteRevokeRequest(BaseModel):
+    person: str = Field(
+        ..., min_length=1,
+        description="Person to revoke access from: short local slug or full Person IRI.",
+    )
+    target: str = Field(..., min_length=1, description="Same target IRI the grant used.")
+    mode: str = Field(default="write", description="'write' or 'replace' -- must match "
+        "the mode the grant was made under; the two are independent grants.")
+
+    @field_validator("mode")
+    @classmethod
+    def _valid_mode(cls, value: str) -> str:
+        if value not in _GRANT_PREDICATE:
+            raise ValueError(f"mode must be one of {sorted(_GRANT_PREDICATE)}")
+        return value
+
+
+@router.post("/write/revoke")
+async def revoke_write(
+    body: WriteRevokeRequest, conn: ConnDep, client: ClientDep, animus: AnimusDep
+) -> dict:
+    """Retract a grantsWrite/grantsReplace edge. Same not-currently-held
+    "not_found" convention as revoke_role -- this is an ordinary, expected
+    outcome (the grant was already gone, or never existed under this
+    exact target string), not something worth a 4xx for."""
+    await _require_admin(conn, client, animus)
+
+    person_iri = _resolve_person(conn, body.person)
+    predicate = _GRANT_PREDICATE[body.mode]
+
+    async def query_fn(q: str) -> dict:
+        return await client.select(conn, q)
+
+    await _require_person_exists(query_fn, conn.holons_graph, person=person_iri)
+
+    holds_grant = await query_fn(
+        f"""PREFIX holon: <{HOLON}>
+ASK {{ GRAPH <{conn.holons_graph}> {{ <{body.target}> holon:{predicate} <{person_iri}> . }} }}"""
+    )
+    if not holds_grant.get("boolean"):
+        return {
+            "ok": False,
+            "person": person_iri,
+            "target": body.target,
+            "mode": body.mode,
+            "note": "not_found: no such grant currently exists",
+        }
+
+    try:
+        await client.update(
+            conn,
+            f"""PREFIX holon: <{HOLON}>
+DELETE DATA {{ GRAPH <{conn.holons_graph}> {{ <{body.target}> holon:{predicate} <{person_iri}> . }} }}""",
+        )
+    except FusekiError as exc:
+        raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
+
+    return {
+        "ok": True,
+        "person": person_iri,
+        "target": body.target,
+        "mode": body.mode,
+        "revoked": True,
+    }
+
+
+class DeactivatePersonRequest(BaseModel):
+    person: str = Field(
+        ..., min_length=1,
+        description="Person to deactivate: short local slug or full Person IRI.",
+    )
+
+
+@router.post("/person/deactivate")
+async def deactivate_person(
+    body: DeactivatePersonRequest, conn: ConnDep, client: ClientDep, animus: AnimusDep
+) -> dict:
+    """Remove a Person's access without deleting the Person -- retraction,
+    not deletion, is the answer to "remove a user" here, because a Person
+    is referenced from provenance (a past act_as's real_person, a
+    scheduler firing, an authored holon) that should never be left
+    dangling just because someone's access ended.
+
+    Three things happen, in one atomic SPARQL Update request (never
+    several separate ``client.update()`` calls -- see the README's own
+    account of the named-rule Replace-mode bug, where splitting one
+    logical operation into two separate HTTP requests is exactly what let
+    a concurrent execution interleave and lose data; every statement here
+    goes out in a single semicolon-joined request instead, the same fix
+    that bug landed on):
+
+    1. Every ``holon:hasRole`` edge this Person holds is retracted, so
+       acl.py's role-based ReadGrant/InvokeGrant checks stop passing
+       immediately.
+    2. Every ``holon:grantsWrite``/``holon:grantsReplace`` edge naming
+       this Person as object is retracted too -- role revocation alone
+       would leave these standing, since check_write/check_replace never
+       consult holon:hasRole at all.
+    3. ``holon:status "inactive"`` is asserted on the Person.
+
+    Step 3 is what actually locks the door: acl.py's resolve_person
+    refuses to resolve an inactive Person's identity at all, so a
+    deactivated caller gets a 401 on their very next request, on ANY
+    route, not just admin-gated ones -- steps 1 and 2 are
+    belt-and-suspenders for anything (a currently-active act_as override,
+    a future code path that reads the graph directly instead of going
+    through identity resolution) that might still be consulting Roles or
+    grants rather than resolved identity. The Person, their label, and
+    their external identity all survive.
+
+    Two things this refuses to do, on purpose:
+
+    - Deactivate the caller's own real identity (``animus.real_person``)
+      -- self-locking an admin out mid-session, with no route back in but
+      the direct-Fuseki bootstrap bypass, is not a mistake this should
+      let happen silently.
+    - Deactivate the dataset's last remaining admin -- the same guard
+      ``revoke_role`` applies to a bare Role revocation, needed here too
+      since deactivation revokes every Role including admin.
+    """
+    await _require_admin(conn, client, animus)
+
+    person_iri = _resolve_person(conn, body.person)
+
+    if person_iri == animus.real_person:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="refusing to deactivate your own authenticated identity",
+        )
+
+    async def query_fn(q: str) -> dict:
+        return await client.select(conn, q)
+
+    await _require_person_exists(query_fn, conn.holons_graph, person=person_iri)
+
+    roles = await _person_roles(query_fn, conn, person=person_iri)
+    role_iris = {r["role"] for r in roles}
+    admin_role = conn.role_iri("admin")
+    if admin_role in role_iris and await _sole_remaining_admin(
+        query_fn, conn, exclude=person_iri
+    ):
+        return {
+            "ok": False,
+            "person": person_iri,
+            "note": "refused: this is the only Person holding the admin role on this "
+            "dataset -- deactivating it would leave no route back in through the REST API",
+        }
+
+    write_grants = await _person_write_grants(query_fn, conn, person=person_iri)
+
+    statements = [
+        f"DELETE DATA {{ GRAPH <{conn.holons_graph}> "
+        f"{{ <{person_iri}> holon:hasRole <{r['role']}> . }} }}"
+        for r in roles
+    ]
+    statements += [
+        f"DELETE DATA {{ GRAPH <{conn.holons_graph}> "
+        f"{{ <{g['target']}> holon:{_GRANT_PREDICATE[g['mode']]} <{person_iri}> . }} }}"
+        for g in write_grants
+    ]
+    statements.append(
+        f"INSERT DATA {{ GRAPH <{conn.holons_graph}> "
+        f'{{ <{person_iri}> holon:status "inactive" . }} }}'
+    )
+    update = f"PREFIX holon: <{HOLON}>\n" + " ;\n".join(statements)
+
+    try:
+        await client.update(conn, update)
+    except FusekiError as exc:
+        raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
+
+    return {
+        "ok": True,
+        "person": person_iri,
+        "deactivated": True,
+        "roles_revoked": sorted(role_iris),
+        "write_grants_revoked": write_grants,
+    }
+
+
+class ReactivatePersonRequest(BaseModel):
+    person: str = Field(
+        ..., min_length=1,
+        description="Person to reactivate: short local slug or full Person IRI.",
+    )
+
+
+@router.post("/person/reactivate")
+async def reactivate_person(
+    body: ReactivatePersonRequest, conn: ConnDep, client: ClientDep, animus: AnimusDep
+) -> dict:
+    """Clear the ``holon:status "inactive"`` marker ``deactivate_person``
+    sets, restoring identity resolution -- nothing else. Deliberately
+    does NOT restore whatever Roles or write/replace grants deactivation
+    revoked: those were a specific, visible set at the moment of
+    deactivation (returned in that call's own response) and re-granting
+    them is a separate, deliberate decision, not something this should do
+    on a caller's behalf. A reactivated Person has no access again,
+    exactly like a fresh create_person call with no ``role`` -- grant_role
+    / grant_write, called explicitly, is how they get any back.
+
+    Idempotent: reactivating a Person who was never deactivated (or
+    already reactivated) is a safe no-op -- DELETE DATA against a triple
+    that isn't there removes nothing, per SPARQL 1.1 Update semantics,
+    without raising.
+    """
+    await _require_admin(conn, client, animus)
+
+    person_iri = _resolve_person(conn, body.person)
+
+    async def query_fn(q: str) -> dict:
+        return await client.select(conn, q)
+
+    await _require_person_exists(query_fn, conn.holons_graph, person=person_iri)
+
+    try:
+        await client.update(
+            conn,
+            f"""PREFIX holon: <{HOLON}>
+DELETE DATA {{ GRAPH <{conn.holons_graph}> {{ <{person_iri}> holon:status "inactive" . }} }}""",
+        )
+    except FusekiError as exc:
+        raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
+
+    return {
+        "ok": True,
+        "person": person_iri,
+        "reactivated": True,
+        "note": "identity resolution restored; no Role or write/replace grants were "
+        "reimplied -- re-grant access explicitly via /admin/role/grant or /admin/write/grant",
+    }

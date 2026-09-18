@@ -36,7 +36,13 @@ holon:PersonShape a sh:NodeShape ;
         [ sh:path holon:hasExternalIdentity ; sh:class holon:ExternalIdentity ; sh:minCount 1 ] ,
         [ sh:path holon:hasRole ; sh:class holon:Role ] ,
         [ sh:path holon:organisation ; sh:datatype xsd:string ; sh:maxCount 1 ] ,
-        [ sh:path holon:location ; sh:datatype xsd:string ; sh:maxCount 1 ] .
+        [ sh:path holon:location ; sh:datatype xsd:string ; sh:maxCount 1 ] ,
+        ## Added 2026-09-18 alongside routes/identity_admin.py's
+        ## deactivate_person/reactivate_person. Absence means active --
+        ## this is not sh:minCount 1, on purpose, so every Person created
+        ## before this existed (and every dataset that never adopts
+        ## deactivation at all) stays conformant without a backfill.
+        [ sh:path holon:status ; sh:in ( "active" "inactive" ) ; sh:maxCount 1 ] .
 
 holon:GitHubIdentityShape a sh:NodeShape ;
     rdfs:comment "The GitHub login backing an external identity link."@en ;

@@ -51,6 +51,13 @@ proposals that *failed* SHACL validation; this one holds proposals that
 passed validation but are held for a human decision before touching
 ground truth). See holonbridge/triggers.py's module docstring for the
 full design.
+
+CHANGED 2026-09-16: added ``named-projections`` for the Named Projection
+feature -- a registry of ``hb:NamedProjection`` entries, each pairing a
+named query with a prompt template. Deliberately not named
+``projections`` (already reserved by the unrelated Projection-Hook
+change-delivery feature) or ``projection-log`` -- see
+holonbridge/named_projections.py's module docstring.
 """
 
 from __future__ import annotations
@@ -70,6 +77,7 @@ GRAPH_ROLES: Final = (
     "scene",
     "shacl",
     "named-queries",
+    "named-projections",
     "named-rules",
     "named-triggers",
     "trigger-log",

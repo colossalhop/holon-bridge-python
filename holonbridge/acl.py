@@ -104,23 +104,42 @@ async def resolve_person(
 
     Mirrors the query already verified by hand against the live store:
     external_id -> holon:hasExternalIdentity/holon:identifier -> Person.
+
+    CHANGED 2026-09-18: a Person carrying ``holon:status "inactive"`` (see
+    ``routes/identity_admin.py``'s ``deactivate_person``) resolves to
+    ``None`` here -- treated identically to an external_id that never
+    matched anything. This is the one place that has to change to make
+    deactivation actually take effect: ``require_animus`` in ``deps.py``
+    builds every caller's ``Animus`` through this function, so a
+    deactivated Person gets a 401 on their very next request, on any
+    route, not only admin-gated ones. ``deactivate_person`` also strips
+    every ``holon:hasRole``/``holon:grantsWrite``/``holon:grantsReplace``
+    edge the Person held, but that alone would leave anything that reads
+    the graph directly -- rather than going through identity resolution --
+    still seeing a Person who merely lost their Roles, not one who is
+    locked out. This check is the one that's actually load-bearing;
+    stripping the edges too is belt-and-suspenders.
     """
     query = f"""
     PREFIX holon: <{HOLON}>
     PREFIX rdfs:  <http://www.w3.org/2000/01/rdf-schema#>
-    SELECT ?person ?label WHERE {{
+    SELECT ?person ?label ?status WHERE {{
       GRAPH <{holons_graph}> {{
         ?person holon:hasExternalIdentity ?identity ;
                 rdfs:label ?label .
         ?identity a holon:{external_id_type} ;
                   holon:identifier {_literal(external_id)} .
+        OPTIONAL {{ ?person holon:status ?status . }}
       }}
     }} LIMIT 1
     """
     rows = _bindings(await _run(query_fn, query))
     if not rows:
         return None
-    return rows[0]["person"]["value"], rows[0]["label"]["value"]
+    row = rows[0]
+    if row.get("status", {}).get("value") == "inactive":
+        return None
+    return row["person"]["value"], row["label"]["value"]
 
 
 async def resolve_teams(

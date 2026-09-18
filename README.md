@@ -104,6 +104,22 @@ Invoke-RestMethod "$env:HB/graphs"   -Headers $h | Select-Object -Expand graphs
 | `GET` | `/endpoints` | All named profiles |
 | `POST` | `/endpoint` | Switch active profile |
 | `POST` | `/endpoints/reload` | Re-read `~/.holonbridge/config.json` |
+| `GET` | `/datasets` | Datasets the backend actually hosts, per Fuseki's own admin API |
+| `GET` | `/datasets/{name}` | Confirm one dataset exists; its graph-role IRIs |
+| `GET` | `/whoami` | The resolved Person, persona, and act_as state for the caller's credential |
+| `GET` | `/persona/list` | Personas in this dataset, and whether the caller holds a Home under each |
+| `POST` | `/persona/switch` | Set the caller's own active persona override (self-service) |
+| `POST` | `/admin/person` | Create a Person, external identity, and optional Role |
+| `GET` | `/admin/persons` | Every Person, with identities, roles, status, write/replace grants |
+| `POST` | `/admin/role/grant` | Grant an existing Person a Role, standalone |
+| `POST` | `/admin/role/revoke` | Retract a Role grant; refuses to strip the last admin |
+| `POST` | `/admin/write/grant` | Grant `grantsWrite`/`grantsReplace` on one target |
+| `POST` | `/admin/write/revoke` | Retract a write/replace grant |
+| `POST` | `/admin/person/deactivate` | Revoke all access, mark inactive; identity stops resolving |
+| `POST` | `/admin/person/reactivate` | Clear the inactive marker; access is not reimplied |
+| `POST` | `/admin/persona/assign` | Mint a Home for an existing Person under a Persona |
+| `POST` | `/admin/act-as` | Admin-only impersonation for exercising real grant checks |
+| `POST` | `/admin/cease-acting-as` | Clear an active act_as override |
 | `POST` | `/sparql/select` | SELECT / ASK → SPARQL JSON |
 | `POST` | `/sparql/construct` | CONSTRUCT / DESCRIBE → Turtle |
 | `POST` | `/sparql/update` | UPDATE against the update endpoint |
@@ -232,6 +248,110 @@ every request — an allowlisted login, not just a valid token — but nothing
 downstream of the gate consumes it. A `DROP` behind a shared secret with no
 caller identity attached is not something to add casually; this waits on
 that identity actually reaching the route layer.
+
+### User administration -- grant, revoke, deactivate
+
+The ACL model (`acl.py`) has always been: a Person resolves from an
+external identity (`resolve_person`, driving `require_animus`); a Person
+holds zero or more Roles; a Role grants ReadGrant/InvokeGrant scoped to a
+Persona or a named query/rule; write and replace access are never
+role-based -- only an explicit `holon:grantsWrite`/`holon:grantsReplace`
+naming that exact (person, target) pair allows them; and a narrowly-held
+admin Role bypasses every check unconditionally, as a break-glass
+capability rather than a role competing for access the ordinary way.
+
+Through 2026-09-01 the only way to *create* any of this was
+`POST /admin/person` (Person + identity + one optional Role, at creation
+time only) and `POST /admin/persona/assign` (a Home under an existing
+Persona). There was no way to grant a Role after the fact, no way to
+create or remove a `grantsWrite`/`grantsReplace` edge at all outside
+hand-written SPARQL, no way to revoke anything, and no way to see, in one
+call, who currently holds what -- auditing "who can do what" meant
+writing the same queries `acl.py` runs internally, by hand, against a
+graph a caller may not even be able to name.
+
+`POST /admin/role/grant` and `POST /admin/role/revoke` close the first
+gap: standalone Role assignment/retraction for a Person who already
+exists, using the identical Turtle shape `create_person`'s own `role`
+field already used, so a Role granted here is indistinguishable from one
+granted at creation time. `POST /admin/write/grant` and
+`POST /admin/write/revoke` do the same for the `grantsWrite`/
+`grantsReplace` axis specifically -- this was the one thing `create_person`
+*never* touched at all, at any point, since writes are deliberately kept
+out of the Role/grants machinery. `GET /admin/persons` closes the read
+gap: Person, external identities, Roles, and write/replace grants, walked
+in one call.
+
+Both revoke routes return `{"ok": false, "note": "not_found: ..."}`
+rather than a 4xx when the thing being revoked was never held -- the same
+convention `assign_persona` already used for "no such Persona"/"no Home
+here": an ordinary, expected outcome, not an error worth a status code
+for.
+
+**Revoking a Person's last admin Role is refused**, by both
+`revoke_role` and `deactivate_person` below. The admin bypass has no
+ordinary-Role fallback underneath it, so a dataset with zero admins left
+has no route back in through the REST API at all -- only
+`holonbridge-bootstrap-admin`, run by hand directly against Fuseki, the
+same chicken-and-egg bypass `bootstrap.py` exists for in the first place.
+Refusing here is cheaper than ever needing that. The guard is a
+check-then-act read followed by a write, not a transactional
+compare-and-set -- two concurrent admins simultaneously revoking *each
+other's* admin Role would each see "another admin still exists" and both
+proceed, the same TOCTOU shape `write_turtle_to_graph` and
+`sequence.py`'s mint already had to close elsewhere in this codebase.
+Worth knowing about; not fixed here, since it needs the same kind of
+compare-and-set the sequence minter uses, which is more machinery than a
+first pass at admin routes warranted.
+
+**Removing a user is `POST /admin/person/deactivate`, not deletion.** A
+Person is referenced from provenance -- a past `act_as`'s `real_person`,
+a scheduler firing, an authored holon -- that should never be left
+dangling just because someone's access ended. Deactivation instead: (1)
+retracts every `holon:hasRole` edge the Person holds, (2) retracts every
+`holon:grantsWrite`/`holon:grantsReplace` edge naming them, and (3)
+asserts `holon:status "inactive"` -- all three in one semicolon-joined
+SPARQL Update request, never several separate `client.update()` calls,
+for the identical reason the named-rule Replace-mode fix (`#12`/`#14`,
+above) landed on one atomic request: splitting a logical multi-step write
+into separate HTTP calls is exactly what let a concurrent execution
+interleave and lose data there, and nothing about that risk is specific
+to named rules.
+
+Step 3 is what actually locks the door, and it required one change to
+`acl.py`: `resolve_person` now treats a Person carrying
+`holon:status "inactive"` exactly like an external id that never
+resolved -- `None`, not a Person with no Roles. Since `require_animus`
+builds every caller's `Animus` through `resolve_person`, a deactivated
+caller gets a 401 on their very next request, on *any* route, not only
+admin-gated ones. Steps 1 and 2 are belt-and-suspenders for anything that
+still consults Roles or grants directly instead of going through identity
+resolution -- `act_as` is the one route that does: `build_animus_as`
+never itself checks `holon:status`, so `POST /admin/act-as` now carries
+its own `FILTER NOT EXISTS { ... holon:status "inactive" }` in its
+target-existence check, refusing to let an admin impersonate a
+deactivated Person even though that Person's own real login no longer
+could.
+
+`deactivate_person` also refuses to deactivate the caller's own real
+identity (`animus.real_person`) -- self-locking an admin out mid-session,
+with no route back in but the direct-Fuseki bootstrap bypass, is not a
+mistake this should let happen silently.
+
+`POST /admin/person/reactivate` clears the `inactive` marker and nothing
+else. Roles and write/replace grants that deactivation stripped are not
+reimplied -- a reactivated Person has no access again, exactly like a
+fresh `create_person` call with no `role`, and getting any back is a
+separate, explicit `grant_role`/`grant_write` call. Silent automatic
+restoration of "whatever they had before" is the kind of thing that reads
+fine right up until it's the wrong call.
+
+The identity shape (`shapes/identity.ttl`) grew one more optional
+property to match: `holon:status`, `sh:in ("active" "inactive")`,
+`maxCount 1`. Deliberately not `sh:minCount 1` -- absence means active,
+so every Person created before this shipped, and every dataset that
+never adopts deactivation at all, stays conformant with no backfill
+needed.
 
 ### Delta-mode SHACL
 

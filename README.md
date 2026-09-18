@@ -1125,4 +1125,3 @@ deliberately not here: the registry is a DataBook artefact, so `push_turtle`
 into `urn:{dataset}:named-queries` plus `reload_named_queries` is the honest
 path until there is a reason for a dedicated write route.
 #
-</content>

@@ -39,6 +39,28 @@ Exposed as the ``holonbridge-bootstrap-admin`` console script (see
 ``scripts/start-holonbridge.ps1`` via new, opt-in ``BOOTSTRAP_ADMIN_*``
 parameters -- unset by default, so nothing changes for anyone who doesn't
 ask for this.
+
+CHANGED 2026-09-18: ``--dataset`` accepts a comma-separated list, not just
+one name -- bootstrapping a fresh identity onto several datasets at once
+(four, in the case that prompted this) used to mean four separate
+invocations, one dataset name typo away from silently bootstrapping the
+wrong one four times over. Comma-separated rather than ``action="append"``
+to match the one other multi-value CLI-adjacent convention already in
+this codebase (``MCP_ALLOWED_GITHUB_LOGINS``). Each name in the list gets
+its own ``Conn`` (same bank, same slug/name/identity/role, different
+dataset) and its own independent ``ensure_admin_person`` call -- one
+dataset failing (unreachable, wrong bank, whatever) is reported and
+skipped rather than aborting the rest, since the datasets in a batch like
+this are typically unrelated to each other and there is no reason a
+problem with one should block bootstrapping the others. The process exit
+code is non-zero if *any* dataset in the batch failed, so a scripted
+caller (a startup hook, say) still sees the batch as failed overall even
+though the log shows which ones actually succeeded.
+
+Omitting ``--dataset`` entirely still means exactly what it always has --
+the bank's own single default dataset -- so nothing about the
+single-dataset, single-invocation case changes for anyone not using the
+new list form.
 """
 
 from __future__ import annotations
@@ -185,7 +207,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         default=None,
-        help="Dataset to bootstrap into. Defaults to the bank's own dataset.",
+        help="Dataset(s) to bootstrap into, comma-separated for more than one "
+        '(e.g. "hcg,crm,datavid,ggsc"). Defaults to the bank\'s own dataset.',
     )
     parser.add_argument(
         "--bank",
@@ -195,15 +218,37 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-async def _run(args: argparse.Namespace) -> int:
-    settings = get_settings()
-    try:
-        conn = _build_conn(bank_name=args.bank, dataset=args.dataset, settings=settings)
-    except KeyError:
-        print(f"error: no bank named {args.bank!r} configured", file=sys.stderr)
-        return 1
+def _parse_datasets(raw: str | None) -> list[str | None]:
+    """``--dataset``'s raw value -> the list of dataset names to bootstrap.
 
-    client = FusekiClient(timeout=settings.request_timeout)
+    ``None`` (the flag omitted) means exactly what it always has: one run
+    against the bank's own default dataset, represented here as a
+    single-item list holding ``None`` so the loop in ``_run`` doesn't need
+    a separate code path for the single-dataset case. A comma-separated
+    value splits and trims whitespace around each name; empty segments
+    (a stray leading/trailing comma) are dropped rather than producing a
+    confusing empty-string dataset name.
+    """
+    if raw is None:
+        return [None]
+    names = [name.strip() for name in raw.split(",")]
+    return [name for name in names if name] or [None]
+
+
+async def _bootstrap_one(
+    client: FusekiClient, *, bank_name: str, dataset: str | None, settings: Settings, args: argparse.Namespace
+) -> bool:
+    """Bootstrap a single dataset; returns whether it succeeded. Never
+    raises -- every failure mode (unknown bank, unreachable server, a
+    FusekiError from the write itself) is caught and printed, so one bad
+    dataset in a ``--dataset a,b,c`` batch doesn't take the rest down with
+    it."""
+    try:
+        conn = _build_conn(bank_name=bank_name, dataset=dataset, settings=settings)
+    except KeyError:
+        print(f"error: no bank named {bank_name!r} configured", file=sys.stderr)
+        return False
+
     try:
         result = await ensure_admin_person(
             client,
@@ -214,12 +259,17 @@ async def _run(args: argparse.Namespace) -> int:
             external_id_type=args.external_id_type,
             role=args.role or None,
         )
-    finally:
-        await client.aclose()
+    except FusekiError as exc:
+        # ensure_admin_person already catches the write's own FusekiError
+        # and returns it as {"ok": False, ...} -- this is for a connect-time
+        # failure (the server unreachable, DNS, etc.) from person_exists's
+        # own read, which happens before that try/except is ever entered.
+        print(f"error: dataset {conn.dataset!r}: {exc}", file=sys.stderr)
+        return False
 
     if not result.get("ok"):
-        print(f"error: {result.get('detail')}", file=sys.stderr)
-        return 1
+        print(f"error: dataset {conn.dataset!r}: {result.get('detail')}", file=sys.stderr)
+        return False
     if result.get("created"):
         print(
             f"[bootstrap-admin] created {result['person']} "
@@ -230,7 +280,29 @@ async def _run(args: argparse.Namespace) -> int:
             f"[bootstrap-admin] {args.external_id!r} already has an identity "
             f"in dataset {conn.dataset!r} -- no change"
         )
-    return 0
+    return True
+
+
+async def _run(args: argparse.Namespace) -> int:
+    settings = get_settings()
+    datasets = _parse_datasets(args.dataset)
+
+    client = FusekiClient(timeout=settings.request_timeout)
+    try:
+        results = [
+            await _bootstrap_one(
+                client, bank_name=args.bank, dataset=dataset, settings=settings, args=args
+            )
+            for dataset in datasets
+        ]
+    finally:
+        await client.aclose()
+
+    if len(datasets) > 1:
+        succeeded = sum(results)
+        print(f"[bootstrap-admin] {succeeded}/{len(datasets)} dataset(s) succeeded")
+
+    return 0 if all(results) else 1
 
 
 def main() -> None:  # pragma: no cover

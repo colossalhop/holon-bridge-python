@@ -72,7 +72,9 @@
 
 .PARAMETER BootstrapAdminDataset
     Dataset to bootstrap into. Defaults to the bank's own dataset when
-    left empty.
+    left empty. Comma-separated for more than one, e.g.
+    "hcg,crm,datavid,ggsc" -- passed straight through as a single
+    --dataset value; see holonbridge.bootstrap._parse_datasets.
 
 .PARAMETER BootstrapAdminBank
     Named bank to bootstrap through (see ~/.holonbridge/config.json).

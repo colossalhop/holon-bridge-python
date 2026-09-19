@@ -163,6 +163,15 @@ async def get_candidate_proposal(
 async def approve_candidate_proposal(
     candidate_id: str, conn: ConnDep, client: ClientDep, animus: AnimusDep
 ) -> dict:
+    """CHANGED: ``approve_candidate`` now routes through the ordinary
+    ACL/SHACL-gated write path (see that function's own docstring), so
+    this now also passes ``animus`` through and lets a 401/403/422/502
+    ``HTTPException`` raised from inside it propagate as-is -- it is
+    already the exact response FastAPI should return, not something to
+    re-wrap. ``CandidateError``/``FusekiError`` stay handled explicitly:
+    the former for "already resolved", the latter for a failure in the
+    status-update write that follows the merge.
+    """
     candidate_iri = conn.scoped("candidates", candidate_id)
     candidate = await get_candidate(client, conn, candidate_iri)
     if candidate is None:
@@ -170,14 +179,14 @@ async def approve_candidate_proposal(
             status.HTTP_404_NOT_FOUND, detail={"error": "unknown_candidate", "id": candidate_id}
         )
     try:
-        await approve_candidate(client, conn, candidate)
+        result = await approve_candidate(client, conn, candidate, animus=animus)
     except CandidateError as exc:
         raise HTTPException(
             status.HTTP_409_CONFLICT, detail={"error": "candidate_not_pending", "message": str(exc)}
         ) from exc
     except FusekiError as exc:
         raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
-    return {"ok": True, "id": candidate_id, "status": "Approved"}
+    return {"id": candidate_id, "status": "Approved", **result}
 
 
 @router.post("/candidate/{candidate_id}/reject")

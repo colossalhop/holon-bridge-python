@@ -47,6 +47,13 @@ class StageRecord:
     detail: str = ""
     triples_written: int = 0
     order: int = 0
+    #: Machine-consumable stage output, distinct from ``detail``'s short
+    #: human-readable summary. Added for pipeline ``llm`` stages: the
+    #: bridge never calls a model itself (see ``pipeline.py``), so a
+    #: ``Deferred`` ``llm`` stage's fully-rendered prompt text lands here
+    #: for whatever does hold the model to read back and act on. Empty for
+    #: every other stage kind.
+    result: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +63,7 @@ class StageRecord:
             "detail": self.detail,
             "triplesWritten": self.triples_written,
             "order": self.order,
+            "result": self.result,
         }
 
 
@@ -151,17 +159,18 @@ WHERE {{
         lines[-1] = lines[-1].rstrip(" ;") + " ."
 
         for index, stage in enumerate(message.stages):
-            lines.extend(
-                [
-                    f"    <{iri}:stage:{index}> a <{HB}MessageStage> ;",
-                    f"      <{HB}stageName> {literal(stage.name)} ;",
-                    f"      <{HB}stageStatus> {literal(stage.status)} ;",
-                    f"      <{HB}transformer> {literal(stage.transformer)} ;",
-                    f"      <{HB}triplesWritten> {literal(str(stage.triples_written), datatype=XSD_INTEGER)} ;",
-                    f"      <{HB}order> {literal(str(stage.order), datatype=XSD_INTEGER)} ;",
-                    f"      <{HB}detail> {literal(stage.detail)} .",
-                ]
-            )
+            stage_lines = [
+                f"    <{iri}:stage:{index}> a <{HB}MessageStage> ;",
+                f"      <{HB}stageName> {literal(stage.name)} ;",
+                f"      <{HB}stageStatus> {literal(stage.status)} ;",
+                f"      <{HB}transformer> {literal(stage.transformer)} ;",
+                f"      <{HB}triplesWritten> {literal(str(stage.triples_written), datatype=XSD_INTEGER)} ;",
+                f"      <{HB}order> {literal(str(stage.order), datatype=XSD_INTEGER)} ;",
+            ]
+            if stage.result:
+                stage_lines.append(f"      <{HB}stageResult> {literal(stage.result)} ;")
+            stage_lines.append(f"      <{HB}detail> {literal(stage.detail)} .")
+            lines.extend(stage_lines)
 
         lines.append("  }")
         return "\n".join(lines)
@@ -210,6 +219,7 @@ WHERE {{
                     detail=s.get("detail", ""),
                     triples_written=int(s.get("triplesWritten", "0") or 0),
                     order=int(s.get("order", "0") or 0),
+                    result=s.get("stageResult", ""),
                 )
                 for s in stages.values()
             ],

@@ -95,6 +95,7 @@ from ..pipeline import (
     topological_order,
 )
 from ..toolset import resolve_reachable
+from ..triggers import propose_pipeline_candidate
 from ..turtle import literal
 
 log = logging.getLogger("holonbridge.routes.pipeline")
@@ -426,6 +427,89 @@ async def _execute(
         await store.save(conn, message)
     except FusekiError:
         log.exception("could not record the outcome of message %s", message.id)
+
+
+# --- pipeline-originated candidates --------------------------------------------
+
+
+class ProposeCandidateRequest(BaseModel):
+    stage: str = Field(..., min_length=1, description="stage id within the pipeline manifest")
+    message_id: str = Field(
+        ..., min_length=1, description="this run's message id, kept as provenance"
+    )
+    turtle: str = Field(..., min_length=1, description="the Turtle to propose for review")
+    target_graph: str | None = Field(
+        default=None,
+        description="defaults to the named stage's own declared targetGraph, if any",
+    )
+
+
+@router.post("/pipeline/{pipeline_id}/propose-candidate")
+async def propose_candidate_from_pipeline(
+    pipeline_id: str,
+    body: ProposeCandidateRequest,
+    conn: ConnDep,
+    client: ClientDep,
+    animus: AnimusDep,
+    personas: PersonasDep,
+) -> dict:
+    """Stage Turtle produced outside the bridge -- from a rendered ``llm``
+    stage's prompt this run already handed back, an external completion, a
+    CNL parse -- as a reviewable candidate tied to this pipeline run. The
+    bridge never calls a model itself (see ``pipeline.py``'s module
+    docstring), so this is the handoff point: whoever holds the actual
+    completion submits it here.
+
+    This call never touches ``target_graph`` -- it only stages the
+    proposal, gated by the same entry-point reachability check
+    `pipeline_run` uses. The actual write happens later, on approval,
+    through the ordinary ACL/SHACL-gated ``approve_candidate`` path,
+    identically to a Named Trigger's own review-required candidates.
+    """
+    await _load_and_authorise_pipeline(pipeline_id, conn, client, animus, personas)
+
+    manifest = await load_manifest(client, conn, pipeline_id)
+    node = manifest.by_id(body.stage)
+    if node is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail={"error": "unknown_stage", "pipeline": pipeline_id, "stage": body.stage},
+        )
+
+    target_graph = body.target_graph or node.target_graph
+    if not target_graph:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "target_graph is required: stage "
+                f"{body.stage!r} declares no targetGraph of its own"
+            ),
+        )
+
+    message = await MessageStore(client).get(conn, body.message_id)
+    if message is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail={"error": "unknown_message", "messageId": body.message_id},
+        )
+
+    candidate_iri = await propose_pipeline_candidate(
+        client,
+        conn,
+        pipeline_id=pipeline_id,
+        stage_id=body.stage,
+        message_iri=message.iri(conn),
+        turtle=body.turtle,
+        target_graph=target_graph,
+    )
+    candidate_id = candidate_iri.rsplit(":", 1)[-1]
+    return {
+        "ok": True,
+        "id": candidate_id,
+        "iri": candidate_iri,
+        "status": "Pending",
+        "targetGraph": target_graph,
+    }
 
 
 # --- ingest -------------------------------------------------------------------

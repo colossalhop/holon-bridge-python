@@ -65,8 +65,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
+from .acl import Animus
 from .conn import Conn
 from .fuseki import FusekiClient, FusekiError
+from .ingest import write_turtle_to_graph
 from .named_queries import NamedQuery, apply_query_params, load_named_queries
 from .named_rules import (
     NamedRule,
@@ -380,6 +382,54 @@ INSERT DATA {{
     return candidate_iri
 
 
+async def propose_pipeline_candidate(
+    client: FusekiClient,
+    conn: Conn,
+    *,
+    pipeline_id: str,
+    stage_id: str,
+    message_iri: str,
+    turtle: str,
+    target_graph: str,
+) -> str:
+    """Stage a pipeline stage's caller-supplied Turtle as a review candidate.
+
+    Sibling to :func:`_write_candidate`: same ``holon:CandidateStatus``
+    class and the same reviewed-then-merge contract via
+    :func:`approve_candidate`, but proposed by a pipeline stage rather than
+    a Named Trigger firing. The bridge never calls an LLM itself -- a
+    pipeline's ``llm`` stages are always recorded ``Deferred`` (see
+    ``pipeline.py``'s module docstring); whatever produced ``turtle``
+    outside the bridge (a human, an external completion, a CNL parse)
+    submits it here, and from this point on it is gated exactly like every
+    other write, through the ordinary ``approve_candidate`` path -- this
+    function itself never touches ``target_graph``.
+    """
+    candidates_graph = conn.graph("candidates")
+    candidate_id = uuid.uuid4().hex
+    candidate_iri = conn.scoped("candidates", candidate_id)
+    now = datetime.now(timezone.utc).isoformat()
+    await client.update(
+        conn,
+        f"""PREFIX hev: <{HEV_NAMESPACE}>
+PREFIX holon: <https://w3id.org/holon/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+INSERT DATA {{
+  GRAPH <{candidates_graph}> {{
+    <{candidate_iri}> a holon:CandidateStatus ;
+      hev:proposedByPipeline "{escape_literal(pipeline_id)}" ;
+      hev:proposedFromStage "{escape_literal(stage_id)}" ;
+      hev:proposedFromMessage <{message_iri}> ;
+      hev:proposedTargetGraph "{escape_literal(target_graph)}" ;
+      hev:proposedTurtle "{escape_literal(turtle)}" ;
+      hev:candidateStatusValue "Pending" ;
+      hev:proposedAt "{now}"^^xsd:dateTime .
+  }}
+}}""",
+    )
+    return candidate_iri
+
+
 def _candidates_query(graph: str) -> str:
     return f"""PREFIX hev: <{HEV_NAMESPACE}>
 SELECT ?c ?p ?o
@@ -392,15 +442,33 @@ WHERE {{
 
 @dataclass
 class Candidate:
+    """A staged write proposal, pending review.
+
+    CHANGED: gained an optional pipeline-shaped provenance set
+    (``pipeline_id``/``stage_id``/``message_iri``), alongside the original
+    trigger-shaped set (``trigger_iri``/``focus``/``firing_iri``/``rule_id``)
+    -- see :func:`propose_pipeline_candidate`. Exactly one provenance set is
+    populated per candidate; the other stays all-empty-string. Both sets are
+    optional (default ``""``) so existing trigger-only construction sites
+    (all of which already pass every field by keyword) need no changes.
+    ``pipeline_id``/``stage_id`` are the plain registry ids a caller already
+    addresses a pipeline/stage by (``Manifest.by_id``/``PipelineNode.id``),
+    not resolved node IRIs; ``message_iri`` is a real resource IRI, since a
+    Message is only ever addressed that way.
+    """
+
     iri: str
-    trigger_iri: str
-    focus: str
-    firing_iri: str
     target_graph: str
     turtle: str
-    rule_id: str
     status: str
     proposed_at: str
+    trigger_iri: str = ""
+    focus: str = ""
+    firing_iri: str = ""
+    rule_id: str = ""
+    pipeline_id: str = ""
+    stage_id: str = ""
+    message_iri: str = ""
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -412,6 +480,9 @@ class Candidate:
             "rule": self.rule_id,
             "status": self.status,
             "proposedAt": self.proposed_at,
+            "pipeline": self.pipeline_id,
+            "stage": self.stage_id,
+            "message": self.message_iri,
         }
 
     def detail(self) -> dict[str, Any]:
@@ -431,14 +502,17 @@ async def list_candidates(
     for iri, props in collect(rows, "c").items():
         cand = Candidate(
             iri=iri,
+            target_graph=pick(props, ("proposedTargetGraph",)) or "",
+            turtle=pick(props, ("proposedTurtle",)) or "",
+            status=pick(props, ("candidateStatusValue",)) or "Pending",
+            proposed_at=pick(props, ("proposedAt",)) or "",
             trigger_iri=pick(props, ("proposedByTrigger",)) or "",
             focus=pick(props, ("proposedFor",)) or "",
             firing_iri=pick(props, ("proposedFromFiring",)) or "",
-            target_graph=pick(props, ("proposedTargetGraph",)) or "",
-            turtle=pick(props, ("proposedTurtle",)) or "",
             rule_id=pick(props, ("proposedRule",)) or "",
-            status=pick(props, ("candidateStatusValue",)) or "Pending",
-            proposed_at=pick(props, ("proposedAt",)) or "",
+            pipeline_id=pick(props, ("proposedByPipeline",)) or "",
+            stage_id=pick(props, ("proposedFromStage",)) or "",
+            message_iri=pick(props, ("proposedFromMessage",)) or "",
         )
         if status is None or cand.status == status:
             out.append(cand)
@@ -471,28 +545,80 @@ WHERE  {{ GRAPH <{registry}> {{ <{candidate.iri}> hev:candidateStatusValue ?old 
 
 
 async def approve_candidate(
-    client: FusekiClient, conn: Conn, candidate: Candidate
-) -> None:
+    client: FusekiClient,
+    conn: Conn,
+    candidate: Candidate,
+    *,
+    animus: Animus,
+    shapes_graph: str | None = None,
+) -> dict[str, Any]:
     """Merge exactly the Turtle the candidate staged into its target graph.
 
-    Deliberately always a merge (Graph Store Protocol POST), regardless of
-    the underlying rule's own declared write mode. An unreviewed action
-    that later gets a human's approval should never be more destructive
-    than strictly additive — Replace/Sync/Supersede semantics involve
-    whole-graph reconciliation against *current* state, and the live graph
-    may well have changed between proposal and approval, so replaying a
-    reconciliation computed at proposal time isn't obviously correct
-    (unlike an add, which is safe regardless of what else changed
-    meanwhile). A trigger whose rule genuinely needs Replace/Sync/Supersede
-    semantics should be registered with ``reviewRequired: false`` instead,
-    which runs the rule for real, through its own declared write mode, via
-    ``execute_named_rule`` — this function is only ever the reviewed path.
+    CHANGED: now routes through ``ingest.write_turtle_to_graph`` -- the
+    same ACL-checked, SHACL-gated, write-locked path ``push_turtle``,
+    ``create_holon``, ``create_message``, and ``/ingest`` all already use --
+    instead of calling ``client.post_graph`` directly. Approving a
+    candidate is a write like any other, and it had no ACL check of any
+    kind before this; a reviewer's approval authorises merging a
+    *specific, already-computed* payload, not a standing bypass of the
+    write gate everything else in this codebase goes through. ``animus``
+    is therefore now required, exactly as it is for every other call site
+    of ``write_turtle_to_graph``.
+
+    Deliberately always a merge (``mode="merge"``, Graph Store Protocol
+    POST), regardless of the underlying rule's own declared write mode. An
+    unreviewed action that later gets a human's approval should never be
+    more destructive than strictly additive — Replace/Sync/Supersede
+    semantics involve whole-graph reconciliation against *current* state,
+    and the live graph may well have changed between proposal and
+    approval, so replaying a reconciliation computed at proposal time
+    isn't obviously correct (unlike an add, which is safe regardless of
+    what else changed meanwhile). A trigger whose rule genuinely needs
+    Replace/Sync/Supersede semantics should be registered with
+    ``reviewRequired: false`` instead, which runs the rule for real,
+    through its own declared write mode, via ``execute_named_rule`` — this
+    function is only ever the reviewed path.
+
+    SHACL validation is opt-in here, via ``shapes_graph`` — unlike
+    ``/ingest``/``push_turtle``, there is no dataset-wide "shacl_required"
+    setting threaded down to this call, so a candidate that names no
+    ``shapes_graph`` merges unvalidated, matching this function's own
+    behaviour before this fix. Pass ``shapes_graph`` explicitly (the
+    dataset's own default, ``conn.shapes_graph``, is a reasonable choice)
+    to have this merge checked like any other gated write.
+
+    Returns whatever ``write_turtle_to_graph`` returns (the validation
+    report, when one ran) rather than ``None``, so a caller can see what
+    actually happened, not just that nothing raised.
     """
     if candidate.status != "Pending":
         raise CandidateError(f"candidate is already {candidate.status}")
+
     if candidate.turtle.strip():
-        await client.post_graph(conn, candidate.target_graph, candidate.turtle)
+        result = await write_turtle_to_graph(
+            turtle=candidate.turtle,
+            graph_iri=candidate.target_graph,
+            mode="merge",
+            shapes_graph=shapes_graph,
+            reduction_rule_id=None,
+            conn=conn,
+            client=client,
+            shacl_required=False,
+            shacl_delta=False,
+            animus=animus,
+        )
+    else:
+        result = {
+            "ok": True,
+            "graph": candidate.target_graph,
+            "dataset": conn.dataset,
+            "mode": "merge",
+            "validated": False,
+            "validation": None,
+        }
+
     await _set_candidate_status(client, conn, candidate=candidate, status="Approved")
+    return result
 
 
 async def reject_candidate(

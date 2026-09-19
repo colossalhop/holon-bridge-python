@@ -21,6 +21,39 @@ transformer run a named rule; ``shacl`` stages validate. ``llm``, ``human``,
 ``external`` and ``composite`` stages are recorded as ``Deferred``, not
 failed — the bridge cannot run a human, and pretending a stage succeeded
 because nothing executed would be worse than saying so.
+
+**Prompt-based ingestion (``llm`` stages with a prompt).** A stage still
+never gets executed by the bridge — the bridge cannot call a model itself,
+and pretending otherwise would be the same mistake ``DEFERRED`` already
+exists to avoid. What changed: a ``llm`` stage may declare ``build:promptText``,
+and when it does, ``_run_llm_stage`` resolves the two fixed placeholders a
+prompt template may use — ``{{input}}`` (this run's own ``params``) and
+``{{context}}`` (the captured result of this stage's one upstream
+context-only dependency, if any) — and records the fully rendered prompt on
+``StageRecord.result``. The stage is still reported ``Deferred``; only what
+accompanies that status changed, from a placeholder sentence to a usable
+prompt. Whatever produced the prompt's actual completion outside the bridge
+(a human, an external model call, a CNL parse) then submits the resulting
+Turtle back through ``triggers.propose_pipeline_candidate`` — staged and
+gated exactly like a Named Trigger's own review-required candidates, never
+written directly. This is deliberately the same reviewed-then-merge
+contract as everything else that writes, not a second, less-audited path.
+
+**Context-only stages.** A ``sparql``/``rule`` stage that reads the graph to
+prepare a mapping, without itself writing anywhere, opts in explicitly with
+``build:contextOnly "true"`` — this is *not* inferred from an absent
+``targetGraph``, because an absent ``targetGraph`` on a stage already has an
+established, different meaning here: fall through to the named rule's own
+declared target (see ``_run_rule_stage``). Overloading that absence to also
+mean "read-only" would silently turn existing real writes into no-ops.
+A context-only stage is never executed via ``execute_named_rule`` (which
+writes for real); instead its rule is bound and previewed read-only via
+``client.construct`` — the same dry-run shape ``triggers.evaluate_triggers``
+already uses for a review-required trigger firing — and the result is kept
+only in this run's own ``context_results`` map (keyed by the stage's IRI),
+for a dependent ``llm`` stage's ``{{context}}`` to resolve against. Nothing
+about a context-only stage's read is written to any graph, logged, or
+otherwise persisted beyond this one run.
 """
 
 from __future__ import annotations
@@ -32,8 +65,10 @@ from typing import Any, Mapping
 from .conn import Conn
 from .fuseki import FusekiClient, FusekiError
 from .messages import Message, StageRecord
-from .named_rules import RuleError, execute_named_rule, load_named_rules
-from .rdfutil import collect, local_name, pick, pick_all
+from .named_projections import render_template
+from .named_rules import RuleError, bind_rule, execute_named_rule, load_named_rules
+from .params import ParameterError
+from .rdfutil import collect, local_name, pick, pick_all, truthy
 from .shacl import validate_full
 
 log = logging.getLogger("holonbridge.pipeline")
@@ -60,8 +95,13 @@ _NODE_FIELDS: dict[str, tuple[str, ...]] = {
     "shapes": ("shapes", "shapesGraph"),
     "projection": ("projection", "hook", "projectionHook"),
     "target_graph": ("targetGraph", "produces", "target"),
+    "prompt_text": ("promptText", "prompt"),
 }
 _DEPENDS = ("dependsOn",)
+#: Explicit opt-in for a read-only stage -- see the module docstring for why
+#: this is a dedicated predicate rather than inferred from an absent
+#: ``targetGraph``.
+_CONTEXT_ONLY = ("contextOnly",)
 
 
 class PipelineError(RuntimeError):
@@ -83,6 +123,13 @@ class PipelineNode:
     projection: str = ""
     target_graph: str = ""
     depends_on: list[str] = field(default_factory=list)
+    #: The stage's own prompt template, from ``build:promptText`` -- only
+    #: meaningful on an ``llm`` stage. See the module docstring.
+    prompt_text: str = ""
+    #: Explicit opt-in: read the graph via this stage's rule, write nothing.
+    #: See the module docstring for why this cannot be inferred from an
+    #: absent ``target_graph``.
+    context_only: bool = False
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -99,6 +146,8 @@ class PipelineNode:
             "projection": self.projection,
             "targetGraph": self.target_graph,
             "dependsOn": self.depends_on,
+            "promptText": self.prompt_text,
+            "contextOnly": self.context_only,
             "executable": self.transformer.lower() in EXECUTABLE,
         }
 
@@ -171,6 +220,16 @@ async def load_manifest(
                 f"{local_name(iri)}: order {raw_order!r} is not an integer; ignored"
             )
 
+        context_only_raw = pick(props, _CONTEXT_ONLY)
+        context_only = truthy(context_only_raw) if context_only_raw is not None else False
+        target_graph = pick(props, _NODE_FIELDS["target_graph"]) or ""
+        if context_only and target_graph:
+            manifest.warnings.append(
+                f"{local_name(iri)} declares both contextOnly and a targetGraph "
+                "-- a stage that both reads for context and writes is a "
+                "modeling error; targetGraph is ignored while contextOnly holds"
+            )
+
         manifest.nodes[iri] = PipelineNode(
             iri=iri,
             id=pick(props, _NODE_FIELDS["id"]) or local_name(iri),
@@ -183,8 +242,10 @@ async def load_manifest(
             rule=pick(props, _NODE_FIELDS["rule"]) or "",
             shapes=pick(props, _NODE_FIELDS["shapes"]) or "",
             projection=pick(props, _NODE_FIELDS["projection"]) or "",
-            target_graph=pick(props, _NODE_FIELDS["target_graph"]) or "",
+            target_graph=target_graph,
             depends_on=pick_all(props, _DEPENDS),
+            prompt_text=pick(props, _NODE_FIELDS["prompt_text"]) or "",
+            context_only=context_only,
         )
 
     manifest.warnings.extend(_type_mismatches(manifest))
@@ -317,6 +378,11 @@ async def run_pipeline(
     """
     order = topological_order(manifest)
     rules = await load_named_rules(client, conn)
+    #: This run's own context-only results, keyed by the producing stage's
+    #: IRI (matching how ``node.depends_on`` itself records dependencies) --
+    #: never written to any graph, never persisted past this call. See the
+    #: module docstring.
+    context_results: dict[str, str] = {}
 
     for index, node in enumerate(order):
         record = StageRecord(
@@ -338,6 +404,10 @@ async def run_pipeline(
             )
             continue
 
+        if transformer == "llm":
+            _run_llm_stage(node, context_results, params, record)
+            continue
+
         if transformer and transformer not in EXECUTABLE:
             record.status = "Deferred"
             record.detail = (
@@ -350,6 +420,9 @@ async def run_pipeline(
         try:
             if node.projection or transformer in {"projection", "external"}:
                 await _run_projection_stage(conn, client, node, record)
+            elif node.context_only and (transformer in {"sparql", "rule"} or node.rule):
+                result = await _run_context_stage(conn, client, node, rules, params, record)
+                context_results[node.iri] = result
             elif transformer in {"sparql", "rule"} or node.rule:
                 await _run_rule_stage(conn, client, node, rules, params, record)
             elif transformer in {"shacl", "validate"}:
@@ -399,6 +472,108 @@ async def _run_rule_stage(
         f"{run.write_mode} into <{run.target_graph}>: "
         f"+{run.triples_added} / -{run.triples_removed}"
     )
+
+
+def _stringify_input(params: Mapping[str, Any] | None) -> str:
+    """Render this run's own ``params`` as the ``{{input}}`` slot's value.
+
+    A single ``"input"`` key is used verbatim, as the raw payload text a
+    caller supplied for exactly this purpose. Otherwise, when there is any
+    other content in ``params``, it is rendered as JSON so a mapping-shaped
+    input is still visible in the prompt rather than silently dropped.
+    Empty when ``params`` is empty or absent -- no run-supplied payload for
+    the placeholder to resolve to.
+    """
+    if not params:
+        return ""
+    if "input" in params:
+        return str(params["input"])
+    import json
+
+    return json.dumps(params, default=str)
+
+
+def _run_llm_stage(
+    node: PipelineNode,
+    context_results: dict[str, str],
+    params: Mapping[str, Any] | None,
+    record: StageRecord,
+) -> None:
+    """Render an ``llm`` stage's prompt. Still never executed by the bridge
+    -- ``record.status`` stays ``"Deferred"`` either way, per ``DEFERRED``
+    above -- but a stage with ``build:promptText`` now hands back a
+    ready-to-send prompt on ``record.result`` instead of only a placeholder
+    sentence. A stage with no ``promptText`` keeps the exact original
+    detail text, unchanged, for backward compatibility.
+
+    ``{{input}}`` resolves via :func:`_stringify_input`. ``{{context}}``
+    resolves to this stage's one upstream context-only dependency's
+    captured result; with zero or more than one such dependency it
+    resolves to an empty string rather than guessing, and that is visible
+    in ``record.detail``. See the module docstring for why a stage must be
+    a *declared* context-only dependency to feed ``{{context}}`` at all.
+    """
+    if not node.prompt_text:
+        record.status = "Deferred"
+        record.detail = "'llm' stages are not executed by the bridge"
+        return
+
+    context_deps = [d for d in node.depends_on if d in context_results]
+    if len(context_deps) == 1:
+        context_value = context_results[context_deps[0]]
+        context_note = f"context from {local_name(context_deps[0])!r}"
+    elif not context_deps:
+        context_value = ""
+        context_note = "no context dependency"
+    else:
+        context_value = ""
+        context_note = f"{len(context_deps)} context dependencies; {{context}} left empty"
+
+    rendered = render_template(
+        node.prompt_text, {"input": _stringify_input(params), "context": context_value}
+    )
+
+    record.status = "Deferred"
+    record.result = rendered
+    record.detail = (
+        f"'llm' stages are not executed by the bridge; prompt rendered ({context_note})"
+    )
+
+
+async def _run_context_stage(
+    conn: Conn,
+    client: FusekiClient,
+    node: PipelineNode,
+    rules,  # RuleLoadResult
+    params: Mapping[str, Any] | None,
+    record: StageRecord,
+) -> str:
+    """Read-only preview of a context-only stage's rule.
+
+    Binds and CONSTRUCTs, the same dry-run shape ``triggers.evaluate_triggers``
+    already uses for a review-required trigger firing -- nothing is written.
+    The result is returned to the caller for ``context_results``, not stored
+    on ``record`` beyond ``record.detail``'s byte count, since it is
+    internal working state for this run, not part of the stage's own
+    public-facing outcome the way an ``llm`` stage's rendered prompt is.
+    """
+    if not node.rule:
+        raise PipelineError(
+            f"context-only stage {node.id!r} declares no rule; nothing to read"
+        )
+    rule = rules.by_id(node.rule)
+    if rule is None:
+        raise PipelineError(f"stage {node.id!r} names unknown rule {node.rule!r}")
+
+    try:
+        sparql = bind_rule(rule, dict(params or {}))
+        turtle = await client.construct(conn, sparql)
+    except (RuleError, ParameterError) as exc:
+        raise PipelineError(str(exc)) from exc
+
+    record.status = "Completed"
+    record.detail = f"context read, {len(turtle)} character(s); not written to any graph"
+    return turtle
 
 
 async def _run_shacl_stage(

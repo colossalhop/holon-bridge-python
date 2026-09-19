@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 from .conn import Conn
 from .fuseki import FusekiClient, FusekiError
@@ -201,3 +201,40 @@ def render_prompt(prompt_text: str, result_text: str) -> str:
     if _RESULT_RE.search(prompt_text):
         return _RESULT_RE.sub(lambda _match: result_text, prompt_text)
     return f"{prompt_text}\n\n{result_text}"
+
+
+def render_template(template: str, slots: Mapping[str, str]) -> str:
+    """Interpolate one or more named ``{{slot}}`` placeholders into a template.
+
+    Generalises this module's own ``render_prompt`` -- a single, fixed
+    ``{{result}}`` slot -- to an arbitrary set of named slots. Added for
+    pipeline ``llm`` stages (``pipeline.py``), which need ``{{input}}`` and
+    ``{{context}}`` resolved at once rather than one fixed placeholder.
+    ``render_prompt`` itself is untouched: it keeps its own regex and
+    behaviour exactly as before, rather than being rewritten in terms of
+    this function, so nothing that already depends on it can be affected
+    by this addition.
+
+    Each substitution still goes through a replacement *function*, not a
+    plain string, for the same reason ``render_prompt`` does: a Turtle or
+    JSON value containing backslashes must never be misread as a regex
+    backreference by ``re.sub``.
+
+    A slot whose placeholder does not appear anywhere in the template is
+    simply unused -- no error. If none of ``slots``' placeholders were
+    found anywhere in the template, the first slot's value is appended
+    rather than silently dropped, preserving the same "a template that
+    forgot its placeholder still gets the value" behaviour ``render_prompt``
+    established.
+    """
+    rendered = template
+    matched_any = False
+    for name, value in slots.items():
+        pattern = re.compile(r"\{\{\s*" + re.escape(name) + r"\s*\}\}")
+        if pattern.search(rendered):
+            matched_any = True
+            rendered = pattern.sub(lambda _match, _value=value: _value, rendered)
+    if not matched_any and slots:
+        first_value = next(iter(slots.values()))
+        rendered = f"{rendered}\n\n{first_value}"
+    return rendered

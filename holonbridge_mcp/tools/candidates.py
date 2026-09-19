@@ -27,6 +27,32 @@ async def get_candidate(candidate_id: str) -> dict:
 
 
 @mcp.tool()
+async def propose_candidate(
+    pipeline_id: str,
+    stage_id: str,
+    message_id: str,
+    turtle: str,
+    target_graph: str | None = None,
+) -> dict:
+    """Stage Turtle produced outside the bridge (a rendered llm-stage
+    prompt's completion, an external tool, a CNL parse) as a reviewable
+    candidate tied to one pipeline run. The bridge never calls a model
+    itself -- this is the handoff point. Never writes anything by itself;
+    the actual merge only happens later, on approve_candidate, gated the
+    same way as any other write."""
+    return await _call(
+        "POST",
+        f"/pipeline/{pipeline_id}/propose-candidate",
+        json_body={
+            "stage": stage_id,
+            "message_id": message_id,
+            "turtle": turtle,
+            "target_graph": target_graph,
+        },
+    )
+
+
+@mcp.tool()
 async def approve_candidate(candidate_id: str) -> dict:
     """Approve a pending candidate: merges its staged Turtle (GSP POST) into
     the target graph, regardless of the underlying rule's own write mode

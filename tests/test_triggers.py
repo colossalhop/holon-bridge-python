@@ -14,9 +14,20 @@ fetched from the repo, not reduced) plus a test-only stub
 without needing ``runner.py``/``proposer.py``/``store.py`` and everything
 *they* import — the real ``scheduler/__init__.py`` is untouched by this PR
 and is exercised for real via ``server.py``'s router wiring instead. Not
-yet run against a full checkout with the FastAPI route layer (routes/triggers.py) 
+yet run against a full checkout with the FastAPI route layer (routes/triggers.py)
 included — same caveat PR #7/#8/#9 each carried forward; see the PR
 description.
+
+CHANGED: ``approve_candidate`` now routes through
+``ingest.write_turtle_to_graph`` (ACL-checked, optionally SHACL-gated,
+write-locked), so the reconstructed tree above now also needs ``acl.py``,
+``ingest.py``, ``shacl.py``, and ``write_lock.py``. ``TriggerStub.select``
+answers ``is_admin``'s own ``ASK`` query (``holon:hasRole`` .. ``:role:admin``)
+with ``True`` unconditionally — the reviewer approving a candidate in these
+tests is simply treated as an admin, which is the simplest way to exercise
+the gated path without also modelling individual ``grantsWrite`` grants;
+``write_lock.for_conn`` is pure in-process locking with no backend calls of
+its own, so it needs no stubbing at all.
 """
 
 from __future__ import annotations
@@ -25,6 +36,7 @@ import re
 
 import pytest
 
+from holonbridge.acl import Animus
 from holonbridge.conn import Conn
 from holonbridge.fuseki import FusekiError
 from holonbridge.named_rules import RuleError
@@ -37,6 +49,7 @@ from holonbridge.triggers import (
     get_candidate,
     list_candidates,
     load_named_triggers,
+    propose_pipeline_candidate,
     reject_candidate,
 )
 
@@ -210,6 +223,14 @@ _CANDIDATE_CREATE = re.compile(
 _CANDIDATE_STATUS_SET = re.compile(
     r'INSERT \{ GRAPH <[^>]+> \{ <([^>]+)> hev:candidateStatusValue "([^"]+)" \} \}'
 )
+_PIPELINE_CANDIDATE_CREATE = re.compile(
+    r"GRAPH <[^>]+> \{ <([^>]+)> a holon:CandidateStatus ;\s*"
+    r'hev:proposedByPipeline "([^"]*)" ;\s*'
+    r'hev:proposedFromStage "([^"]*)" ;\s*'
+    r"hev:proposedFromMessage <([^>]+)> ;\s*"
+    r'hev:proposedTargetGraph "([^"]*)" ;\s*'
+    r'hev:proposedTurtle "([^"]*)" ;'
+)
 
 _UNESCAPE = {"\\\\": "\\", '\\"': '"', "\\n": "\n", "\\r": "\r", "\\t": "\t"}
 _UNESCAPE_PATTERN = re.compile("|".join(re.escape(k) for k in _UNESCAPE))
@@ -254,6 +275,12 @@ class TriggerStub:
         self._candidates: dict[str, dict[str, str]] = {}
 
     async def select(self, conn, query, *, default_graph=None):
+        if "ASK" in query and "holon:hasRole" in query and ":role:admin" in query:
+            # Simulate an admin reviewer -- see the module docstring's
+            # "CHANGED" note. Short-circuits check_write/check_replace to
+            # "admin role bypass" without modelling individual grants.
+            return {"boolean": True}
+
         if "ASK {" in query and "firedTrigger" in query:
             for trig_iri, focus in self.already_fired:
                 if trig_iri in query and focus in query:
@@ -317,6 +344,22 @@ class TriggerStub:
             }
             return
 
+        pipeline_created = _PIPELINE_CANDIDATE_CREATE.search(normalised)
+        if pipeline_created:
+            iri, pipeline_id, stage_id, message_iri, target_graph, turtle = (
+                pipeline_created.groups()
+            )
+            self._candidates[iri] = {
+                "proposedByPipeline": _unescape_literal(pipeline_id),
+                "proposedFromStage": _unescape_literal(stage_id),
+                "proposedFromMessage": message_iri,
+                "proposedTargetGraph": _unescape_literal(target_graph),
+                "proposedTurtle": _unescape_literal(turtle),
+                "candidateStatusValue": "Pending",
+                "proposedAt": "2026-08-26T00:00:00+00:00",
+            }
+            return
+
         status_set = _CANDIDATE_STATUS_SET.search(normalised)
         if status_set:
             iri, status = status_set.groups()
@@ -341,6 +384,17 @@ def stub() -> TriggerStub:
 @pytest.fixture
 def conn() -> Conn:
     return Conn(base_url="http://x", dataset="ds", overridden=False, bank_name="local")
+
+
+@pytest.fixture
+def animus() -> Animus:
+    """A resolved reviewer identity for approve_candidate/write_turtle_to_graph
+    -- TriggerStub.select answers this person's admin-role ASK with True."""
+    return Animus(
+        external_id="test-reviewer",
+        external_id_type="Test",
+        person="urn:ds:person:reviewer",
+    )
 
 
 # --- loading -------------------------------------------------------------------
@@ -506,16 +560,31 @@ async def test_unknown_rule_is_reported_not_raised(stub, conn):
 
 
 @pytest.mark.asyncio
-async def test_approve_merges_the_staged_turtle_into_the_target_graph(stub, conn):
+async def test_approve_merges_the_staged_turtle_into_the_target_graph(stub, conn, animus):
     await evaluate_triggers(stub, conn, kind=TRIGGER_STATE)
     candidates = await list_candidates(stub, conn, status="Pending")
     hit = next(c for c in candidates if c.trigger_iri.endswith("min-age-violation"))
 
-    await approve_candidate(stub, conn, hit)
+    await approve_candidate(stub, conn, hit, animus=animus)
 
     assert (hit.target_graph, stub.turtle) in stub.pushed
     refreshed = await get_candidate(stub, conn, hit.iri)
     assert refreshed.status == "Approved"
+
+
+@pytest.mark.asyncio
+async def test_approve_is_gated_by_acl(stub, conn):
+    """CHANGED: approve_candidate now requires a resolved identity, same as
+    every other call site of write_turtle_to_graph."""
+    from fastapi import HTTPException
+
+    await evaluate_triggers(stub, conn, kind=TRIGGER_STATE)
+    candidates = await list_candidates(stub, conn, status="Pending")
+    hit = next(c for c in candidates if c.trigger_iri.endswith("min-age-violation"))
+
+    unresolved = Animus(external_id="nobody", external_id_type="Test", person=None)
+    with pytest.raises(HTTPException):
+        await approve_candidate(stub, conn, hit, animus=unresolved)
 
 
 @pytest.mark.asyncio
@@ -536,15 +605,63 @@ async def test_reject_never_touches_the_target_graph(stub, conn):
 
 
 @pytest.mark.asyncio
-async def test_approving_a_non_pending_candidate_is_refused(stub, conn):
+async def test_approving_a_non_pending_candidate_is_refused(stub, conn, animus):
     await evaluate_triggers(stub, conn, kind=TRIGGER_STATE)
     candidates = await list_candidates(stub, conn, status="Pending")
     hit = next(c for c in candidates if c.trigger_iri.endswith("min-age-violation"))
-    await approve_candidate(stub, conn, hit)
+    await approve_candidate(stub, conn, hit, animus=animus)
 
     stale = await get_candidate(stub, conn, hit.iri)  # now Approved
     with pytest.raises(CandidateError):
-        await approve_candidate(stub, conn, stale)
+        await approve_candidate(stub, conn, stale, animus=animus)
+
+
+# --- pipeline-originated candidates ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pipeline_candidate_carries_pipeline_shaped_provenance(stub, conn):
+    candidate_iri = await propose_pipeline_candidate(
+        stub,
+        conn,
+        pipeline_id="cnl-ingest",
+        stage_id="map",
+        message_iri="urn:ds:message:abc123",
+        turtle="<urn:x> <urn:y> <urn:z> .",
+        target_graph="urn:ds:staging",
+    )
+
+    candidate = await get_candidate(stub, conn, candidate_iri)
+    assert candidate is not None
+    assert candidate.pipeline_id == "cnl-ingest"
+    assert candidate.stage_id == "map"
+    assert candidate.message_iri == "urn:ds:message:abc123"
+    assert candidate.target_graph == "urn:ds:staging"
+    assert candidate.turtle == "<urn:x> <urn:y> <urn:z> ."
+    assert candidate.status == "Pending"
+    # No trigger-shaped provenance leaks in from the other proposal shape.
+    assert candidate.trigger_iri == ""
+    assert candidate.firing_iri == ""
+
+
+@pytest.mark.asyncio
+async def test_pipeline_candidate_approves_through_the_same_gated_path(stub, conn, animus):
+    candidate_iri = await propose_pipeline_candidate(
+        stub,
+        conn,
+        pipeline_id="cnl-ingest",
+        stage_id="map",
+        message_iri="urn:ds:message:abc123",
+        turtle="<urn:x> <urn:y> <urn:z> .",
+        target_graph="urn:ds:staging",
+    )
+    candidate = await get_candidate(stub, conn, candidate_iri)
+
+    await approve_candidate(stub, conn, candidate, animus=animus)
+
+    assert ("urn:ds:staging", "<urn:x> <urn:y> <urn:z> .") in stub.pushed
+    refreshed = await get_candidate(stub, conn, candidate_iri)
+    assert refreshed.status == "Approved"
 
 
 if __name__ == "__main__":

@@ -13,7 +13,13 @@ from holonbridge.config import Settings
 from holonbridge.conn import Conn
 from holonbridge.fetch import SourceFetchError
 from holonbridge.messages import Message, MessageStore, StageRecord
-from holonbridge.pipeline import Manifest, PipelineError, PipelineNode, topological_order
+from holonbridge.pipeline import (
+    Manifest,
+    PipelineError,
+    PipelineNode,
+    run_pipeline,
+    topological_order,
+)
 from holonbridge.routes import pipeline as pipeline_routes
 from holonbridge.server import create_app
 
@@ -372,6 +378,116 @@ def test_background_run_returns_a_message_id_immediately(client):
     assert body["pipeline"] == "build"
     assert len(body["messageId"]) == 32
     assert body["status"] == "Received"
+
+
+# --- prompt-based ingestion: context-only stages + llm rendering ---------------
+#
+# Exercised by calling run_pipeline() directly against a hand-built Manifest
+# and a PipelineStub, the same way test_topological_order_is_stable_without_
+# declared_orders() above bypasses the FastAPI/AnimusDep layer entirely --
+# nothing here needs an identity or an ACL decision, only pipeline.py's own
+# execution logic.
+
+
+def test_context_only_stage_is_read_only_and_feeds_llm_context(stub):
+    manifest = Manifest(id="cnl", graph="urn:ds:pipeline:cnl")
+    manifest.nodes = {
+        "db2:source": PipelineNode(iri="db2:source", id="source", kind="Source"),
+        "db2:context": PipelineNode(
+            iri="db2:context",
+            id="context",
+            kind="Stage",
+            transformer="sparql",
+            rule="context-rule",
+            context_only=True,
+            order=1,
+            depends_on=["db2:source"],
+        ),
+        "db2:map": PipelineNode(
+            iri="db2:map",
+            id="map",
+            kind="Stage",
+            transformer="llm",
+            prompt_text="Context:\n{{context}}\n\nInput:\n{{input}}",
+            order=2,
+            depends_on=["db2:context"],
+        ),
+    }
+
+    # context-rule declares its own targetGraph, deliberately, so the test
+    # actually proves a context-only stage never writes there -- it isn't
+    # read-only merely because no target was configured anywhere.
+    stub.rules = stub.rules + [
+        _row(r="urn:ds:named-rule:context-rule", type=RULE_TYPE, p=f"{HB}id", o="context-rule"),
+        _row(r="urn:ds:named-rule:context-rule", type=RULE_TYPE, p=f"{HB}construct", o=CONSTRUCT),
+        _row(
+            r="urn:ds:named-rule:context-rule",
+            type=RULE_TYPE,
+            p=f"{HB}targetGraph",
+            o="urn:ds:should-never-be-written",
+        ),
+        _row(r="urn:ds:named-rule:context-rule", type=RULE_TYPE, p=f"{HB}writeMode", o="Append"),
+        _row(r="urn:ds:named-rule:context-rule", type=RULE_TYPE, p=f"{HB}ruleStatus", o="Active"),
+    ]
+
+    message = Message(id="m1", pipeline="cnl")
+
+    import asyncio
+
+    asyncio.run(
+        run_pipeline(conn(), stub, manifest, message, params={"input": "raw source text"})
+    )
+
+    stages = {s.name: s for s in message.stages}
+    assert stages["source"].status == "Skipped"
+    assert stages["context"].status == "Completed"
+    assert "not written to any graph" in stages["context"].detail
+    assert not any(g == "urn:ds:should-never-be-written" for g, _ in stub.pushed)
+
+    map_stage = stages["map"]
+    assert map_stage.status == "Deferred"
+    assert "raw source text" in map_stage.result
+    assert "<urn:a> <urn:b> <urn:c> ." in map_stage.result  # the stub's construct() output
+    assert message.error == ""
+
+
+def test_llm_stage_without_prompt_text_keeps_the_original_placeholder_detail(stub):
+    """No regression for existing manifests: an ``llm`` stage that declares
+    no ``promptText`` (like ``build``'s own ``shapes`` stage) keeps the
+    exact original detail text and an empty ``result``."""
+    manifest = Manifest(id="cnl2", graph="urn:ds:pipeline:cnl2")
+    manifest.nodes = {
+        "db3:shapes": PipelineNode(
+            iri="db3:shapes", id="shapes", kind="Stage", transformer="llm"
+        ),
+    }
+    message = Message(id="m2", pipeline="cnl2")
+
+    import asyncio
+
+    asyncio.run(run_pipeline(conn(), stub, manifest, message))
+
+    stage = message.stages[0]
+    assert stage.status == "Deferred"
+    assert stage.detail == "'llm' stages are not executed by the bridge"
+    assert stage.result == ""
+
+
+def test_context_only_and_target_graph_together_is_flagged_at_load_time(client, stub):
+    """A stage that both reads for context and declares a targetGraph is a
+    modeling error the schema should catch -- see pipeline.py's load_manifest."""
+    stub.manifests["confused"] = [
+        _row(
+            n="db4:both",
+            type=f"{BUILD}Stage",
+            p=f"{BUILD}id",
+            o="both",
+        ),
+        _row(n="db4:both", type=f"{BUILD}Stage", p=f"{BUILD}contextOnly", o="true"),
+        _row(n="db4:both", type=f"{BUILD}Stage", p=f"{BUILD}targetGraph", o="urn:ds:somewhere"),
+    ]
+    body = client.get("/pipeline/confused", headers=auth()).json()
+    assert any("contextOnly" in w and "targetGraph" in w for w in body["warnings"])
 
 
 # --- ingest -------------------------------------------------------------------

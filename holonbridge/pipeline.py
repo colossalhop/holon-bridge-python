@@ -39,6 +39,20 @@ gated exactly like a Named Trigger's own review-required candidates, never
 written directly. This is deliberately the same reviewed-then-merge
 contract as everything else that writes, not a second, less-audited path.
 
+**Extra param slots.** Beyond ``{{input}}``/``{{context}}``, every other key
+in this run's own ``params`` is exposed as its own ``{{name}}`` slot too —
+e.g. a caller passing ``params={"input": ..., "submitter": "<person IRI>"}``
+gets a working ``{{submitter}}`` placeholder in the prompt template, with no
+bespoke field needed for every piece of run-specific metadata a template
+might want. This exists because a completion produced outside the bridge
+(a human, an external model) has no other reliable way to learn who is
+actually running this pipeline invocation — the bridge knows that (or
+whatever else the caller supplies) and can simply hand it over. ``{{input}}``
+keeps its own reserved, whole-payload meaning (see ``_stringify_input``) and
+is never duplicated or overridden by this — an ``"input"`` key in ``params``
+is consumed only by the ``{{input}}`` slot, not also exposed under its own
+name.
+
 **Context-only stages.** A ``sparql``/``rule`` stage that reads the graph to
 prepare a mapping, without itself writing anywhere, opts in explicitly with
 ``build:contextOnly "true"`` — this is *not* inferred from an absent
@@ -493,6 +507,21 @@ def _stringify_input(params: Mapping[str, Any] | None) -> str:
     return json.dumps(params, default=str)
 
 
+def _extra_param_slots(params: Mapping[str, Any] | None) -> dict[str, str]:
+    """Every ``params`` key besides ``"input"`` itself, stringified, so a
+    prompt template can name any of them directly as its own ``{{slot}}``.
+
+    See the module docstring's "Extra param slots" section for why this
+    exists. ``"input"`` is deliberately excluded here even though it is
+    also a key in ``params`` — it already has its own reserved slot via
+    :func:`_stringify_input`, and exposing it a second time under its own
+    name would be pure duplication, not a second distinct piece of data.
+    """
+    if not params:
+        return {}
+    return {str(key): str(value) for key, value in params.items() if key != "input"}
+
+
 def _run_llm_stage(
     node: PipelineNode,
     context_results: dict[str, str],
@@ -512,6 +541,9 @@ def _run_llm_stage(
     resolves to an empty string rather than guessing, and that is visible
     in ``record.detail``. See the module docstring for why a stage must be
     a *declared* context-only dependency to feed ``{{context}}`` at all.
+    Every other ``params`` key is also available as its own ``{{name}}``
+    slot via :func:`_extra_param_slots` — see the module docstring's "Extra
+    param slots" section.
     """
     if not node.prompt_text:
         record.status = "Deferred"
@@ -530,7 +562,12 @@ def _run_llm_stage(
         context_note = f"{len(context_deps)} context dependencies; {{context}} left empty"
 
     rendered = render_template(
-        node.prompt_text, {"input": _stringify_input(params), "context": context_value}
+        node.prompt_text,
+        {
+            "input": _stringify_input(params),
+            "context": context_value,
+            **_extra_param_slots(params),
+        },
     )
 
     record.status = "Deferred"

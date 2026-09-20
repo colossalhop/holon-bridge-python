@@ -473,6 +473,78 @@ def test_llm_stage_without_prompt_text_keeps_the_original_placeholder_detail(stu
     assert stage.result == ""
 
 
+def test_llm_stage_exposes_extra_params_as_named_slots(stub):
+    """A caller-supplied param beyond ``input`` -- e.g. ``submitter`` -- is
+    available as its own ``{{name}}`` placeholder, so a prompt template can
+    ask for run-specific metadata the bridge already knows (who is running
+    this invocation) without a bespoke field for every such use. See
+    pipeline.py's "Extra param slots" and ``_extra_param_slots``."""
+    manifest = Manifest(id="cnl5", graph="urn:ds:pipeline:cnl5")
+    manifest.nodes = {
+        "db5:map": PipelineNode(
+            iri="db5:map",
+            id="map",
+            kind="Stage",
+            transformer="llm",
+            prompt_text="Submitter: {{submitter}}\nInput: {{input}}",
+        ),
+    }
+    message = Message(id="m5", pipeline="cnl5")
+
+    import asyncio
+
+    asyncio.run(
+        run_pipeline(
+            conn(),
+            stub,
+            manifest,
+            message,
+            params={
+                "input": "CausalSpark uses HolonBridge.",
+                "submitter": "urn:causalspark:person:caroline",
+            },
+        )
+    )
+
+    stage = message.stages[0]
+    assert stage.status == "Deferred"
+    assert "Submitter: urn:causalspark:person:caroline" in stage.result
+    assert "Input: CausalSpark uses HolonBridge." in stage.result
+    # "input" is consumed only by {{input}} -- never also exposed under its
+    # own name, so no leftover, unsubstituted placeholder should remain.
+    assert "{{input}}" not in stage.result
+    assert "{{submitter}}" not in stage.result
+
+
+def test_llm_stage_extra_param_slot_is_unused_without_a_matching_placeholder(stub):
+    """A param the template never names is simply unused -- no error, and
+    (unlike render_template's own "nothing matched" fallback) it must not
+    get silently appended just because *some* other slot (``{{input}}``)
+    did match."""
+    manifest = Manifest(id="cnl6", graph="urn:ds:pipeline:cnl6")
+    manifest.nodes = {
+        "db6:map": PipelineNode(
+            iri="db6:map", id="map", kind="Stage", transformer="llm", prompt_text="Input: {{input}}"
+        ),
+    }
+    message = Message(id="m6", pipeline="cnl6")
+
+    import asyncio
+
+    asyncio.run(
+        run_pipeline(
+            conn(),
+            stub,
+            manifest,
+            message,
+            params={"input": "text", "unused_metadata": "should not appear"},
+        )
+    )
+
+    stage = message.stages[0]
+    assert stage.result == "Input: text"
+
+
 def test_context_only_and_target_graph_together_is_flagged_at_load_time(client, stub):
     """A stage that both reads for context and declares a targetGraph is a
     modeling error the schema should catch -- see pipeline.py's load_manifest."""

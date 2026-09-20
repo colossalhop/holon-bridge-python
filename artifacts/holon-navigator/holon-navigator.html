@@ -1,0 +1,929 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Holon Navigator</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,400;0,500;0,600;1,400&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root{
+    --ink:#161b26;
+    --ink-soft:#4b5566;
+    --ink-faint:#828d9c;
+    --paper:#eef1f6;
+    --card:#ffffff;
+    --line:#d7dce4;
+    --accent:#35478f;
+    --accent-soft:#e4e7f6;
+    --accent-warm:#9a6420;
+    --accent-warm-soft:#f3e7d4;
+    --good:#2f7d5a;
+    --bad:#b0432f;
+    --shadow: 0 1px 2px rgba(22,27,38,0.06), 0 8px 24px -12px rgba(22,27,38,0.18);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --ink:#e9edf5;
+      --ink-soft:#a8b1c2;
+      --ink-faint:#6e7889;
+      --paper:#0b0e15;
+      --card:#131926;
+      --line:#232c3d;
+      --accent:#8b9aec;
+      --accent-soft:#1c2440;
+      --accent-warm:#d99a4e;
+      --accent-warm-soft:#332512;
+      --good:#5fbf8f;
+      --bad:#e2755f;
+      --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 12px 32px -16px rgba(0,0,0,0.6);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ink:#e9edf5;
+    --ink-soft:#a8b1c2;
+    --ink-faint:#6e7889;
+    --paper:#0b0e15;
+    --card:#131926;
+    --line:#232c3d;
+    --accent:#8b9aec;
+    --accent-soft:#1c2440;
+    --accent-warm:#d99a4e;
+    --accent-warm-soft:#332512;
+    --good:#5fbf8f;
+    --bad:#e2755f;
+    --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 12px 32px -16px rgba(0,0,0,0.6);
+  }
+
+  *{box-sizing:border-box;}
+  body{
+    background:var(--paper);
+    color:var(--ink);
+    font-family:'Public Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size:14.5px;
+    line-height:1.5;
+  }
+  @media (prefers-reduced-motion: reduce){
+    *{animation-duration:0.001ms !important; transition-duration:0.001ms !important;}
+  }
+
+  .app{ display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+
+  .topbar{
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap; row-gap:8px;
+    padding:14px 22px;
+    border-bottom:1px solid var(--line);
+    background:var(--card);
+  }
+  .bridge-picker{ display:flex; align-items:center; gap:6px; }
+  .bp-label{
+    font-family:'IBM Plex Mono', monospace;
+    font-size:11px; text-transform:uppercase; letter-spacing:0.04em;
+    color:var(--ink-faint);
+  }
+  .bp-select{
+    font:inherit; font-size:12px;
+    padding:3px 7px;
+    border:1px solid var(--line);
+    border-radius:6px;
+    background:var(--paper);
+    color:var(--ink);
+    max-width:160px;
+  }
+  .bp-select:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  .bp-select:disabled{ opacity:0.55; }
+  .topbar h1{
+    font-family:'Spectral', Georgia, serif;
+    font-weight:600;
+    font-size:19px;
+    letter-spacing:0.2px;
+    margin:0;
+    text-wrap:balance;
+  }
+  .topbar .dot{
+    width:8px; height:8px; border-radius:50%;
+    background:var(--ink-faint);
+    flex:none;
+    position:relative;
+    top:1px;
+  }
+  .dot.ok{ background:var(--good); }
+  .dot.bad{ background:var(--bad); }
+  .topbar .status{
+    display:flex; align-items:center; gap:7px;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:12px;
+    color:var(--ink-soft);
+    white-space:nowrap;
+  }
+  .topbar .status b{ color:var(--ink); font-weight:500; }
+  .topbar .spacer{ flex:1; }
+  .topbar .count{
+    font-family:'IBM Plex Mono', monospace;
+    font-size:12px;
+    color:var(--ink-faint);
+  }
+
+  .layout{ display:flex; flex:1; min-height:0; }
+  .layout.resizing{ cursor:col-resize; }
+  .layout.resizing *{ user-select:none !important; }
+
+  .rail{
+    width:var(--rail-width, 320px); flex:none;
+    min-height:0;
+    display:flex; flex-direction:column;
+    background:var(--card);
+  }
+
+  /* Draggable divider between the rail (selection) and detail (display/
+     edit) panes. A slim hit target with a thin visual line centred in it,
+     so it's easy to grab without looking like a thick border. Keyboard
+     users can focus it and press the arrow keys; double-click/Enter
+     resets to the default width. */
+  .rail-resizer{
+    flex:none;
+    width:9px;
+    margin:0 -4px;
+    position:relative;
+    z-index:1;
+    cursor:col-resize;
+    background:transparent;
+    border:none;
+    padding:0;
+    -webkit-tap-highlight-color:transparent;
+  }
+  .rail-resizer::before{
+    content:'';
+    position:absolute;
+    top:0; bottom:0; left:4px;
+    width:1px;
+    background:var(--line);
+  }
+  .rail-resizer:hover::before,
+  .rail-resizer:focus-visible::before,
+  .layout.resizing .rail-resizer::before{
+    left:3px; width:3px;
+    background:var(--accent);
+  }
+  .rail-resizer:focus-visible{ outline:none; }
+  .rail-search{ padding:14px 14px 10px; border-bottom:1px solid var(--line); }
+  .rail-search input{
+    width:100%;
+    font:inherit;
+    font-size:13.5px;
+    padding:8px 10px;
+    border:1px solid var(--line);
+    border-radius:7px;
+    background:var(--paper);
+    color:var(--ink);
+  }
+  .rail-search input:focus{
+    outline:2px solid var(--accent);
+    outline-offset:1px;
+  }
+  .rail-search input::placeholder{ color:var(--ink-faint); }
+
+  .viewtabs{ padding:12px 12px 0; }
+  .view-select{
+    width:100%;
+    font:inherit; font-size:12.8px; font-weight:600;
+    padding:8px 30px 8px 10px;
+    border-radius:7px;
+    border:1px solid var(--line);
+    background:var(--paper) url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6"><path d="M0 0l5 6 5-6z" fill="%23888"/></svg>') no-repeat right 10px center;
+    -webkit-appearance:none; appearance:none;
+    color:var(--ink);
+    cursor:pointer;
+  }
+  .view-select:hover{ border-color:var(--ink-soft); }
+  .view-select:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+
+  .list{ flex:1; min-height:0; overflow-y:auto; padding:6px; }
+  .list-empty{ padding:24px 16px; color:var(--ink-faint); font-size:13px; }
+  .list-group-header{
+    position:sticky; top:0;
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    background:var(--card);
+    padding:10px 8px 5px;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:10.5px;
+    text-transform:uppercase;
+    letter-spacing:0.06em;
+    color:var(--ink-faint);
+    border-bottom:1px solid var(--line);
+    margin-bottom:3px;
+  }
+  .group-add-btn{
+    flex:none;
+    width:17px; height:17px;
+    display:flex; align-items:center; justify-content:center;
+    border-radius:5px;
+    border:1px solid var(--line);
+    background:var(--card);
+    color:var(--ink-soft);
+    font-size:13px; line-height:1;
+    font-family:inherit;
+    text-transform:none; letter-spacing:normal;
+    padding:0; margin-bottom:5px;
+    cursor:pointer;
+  }
+  .group-add-btn:hover{ border-color:var(--accent); color:var(--accent); background:var(--accent-soft); }
+  .group-add-btn:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+
+  .tree{ flex:1; min-height:0; overflow-y:auto; padding:6px; }
+  .tree-empty{ padding:24px 16px; color:var(--ink-faint); font-size:13px; }
+  .tree-row{
+    display:flex; align-items:center; gap:7px;
+    padding:7px 8px;
+    border-radius:8px;
+    cursor:pointer;
+  }
+  .tree-row:hover{ background:var(--paper); }
+  .tree-row.active{ background:var(--accent-soft); }
+  .tree-toggle{
+    flex:none;
+    width:16px; height:16px;
+    display:flex; align-items:center; justify-content:center;
+    border:none; background:none; padding:0;
+    color:var(--ink-faint);
+    font-size:9px;
+    cursor:pointer;
+    transition:transform .15s;
+  }
+  .tree-toggle.expanded{ transform:rotate(90deg); }
+  .tree-toggle.leaf{ visibility:hidden; cursor:default; }
+  .tree-toggle:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  .tree-label{
+    flex:1; min-width:0;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    font-size:13.4px;
+  }
+  .tree-row.active .tree-label{ color:var(--accent); font-weight:600; }
+  .tree-label.connection{ font-style:italic; }
+  .tree-type{
+    flex:none;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:10px;
+    text-transform:uppercase;
+    letter-spacing:0.04em;
+    color:var(--ink-faint);
+  }
+  .tree-loading{ padding:6px 8px; color:var(--ink-faint); font-size:12px; font-style:italic; }
+
+  .row{
+    display:flex; align-items:center; gap:10px;
+    width:100%; text-align:left;
+    padding:9px 10px;
+    border:none; background:none;
+    border-radius:8px;
+    cursor:pointer;
+    color:var(--ink);
+    font:inherit;
+  }
+  .row:hover{ background:var(--paper); }
+  .row:focus-visible{ outline:2px solid var(--accent); outline-offset:-2px; }
+  .row.active{ background:var(--accent-soft); }
+  .row .row-label{
+    flex:1; min-width:0;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    font-size:13.6px;
+  }
+  .row .row-type{
+    flex:none;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:10.5px;
+    text-transform:uppercase;
+    letter-spacing:0.04em;
+    color:var(--ink-faint);
+    background:var(--paper);
+    border:1px solid var(--line);
+    padding:2px 6px;
+    border-radius:5px;
+    max-width:112px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .row.active .row-type{ background:var(--card); }
+
+  .rail-footer{
+    border-top:1px solid var(--line);
+    padding:10px 14px;
+    display:flex; align-items:center; justify-content:space-between;
+    gap:8px;
+  }
+  .rail-footer .updated{
+    font-family:'IBM Plex Mono', monospace;
+    font-size:10.5px;
+    color:var(--ink-faint);
+  }
+  .btn{
+    font:inherit; font-size:12.5px; font-weight:600;
+    padding:6px 11px;
+    border-radius:7px;
+    border:1px solid var(--line);
+    background:var(--card);
+    color:var(--ink);
+    cursor:pointer;
+  }
+  .btn:hover{ border-color:var(--accent); color:var(--accent); }
+  .btn:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  .btn.primary{ background:var(--accent); border-color:var(--accent); color:#fff; }
+  .btn.primary:hover{ opacity:0.92; color:#fff; }
+
+  .detail{ flex:1; min-width:0; min-height:0; overflow-y:auto; padding:34px 40px 60px; }
+  .detail-inner{ max-width:680px; }
+
+  .actions{ margin:0 0 22px; display:flex; gap:8px; flex-wrap:wrap; }
+  .addchild-form{
+    margin:0 0 26px;
+    padding:16px 18px;
+    border:1px solid var(--line);
+    border-radius:10px;
+    background:var(--paper);
+    max-width:480px;
+  }
+  .addchild-form h3{ font-family:'Spectral', serif; font-size:16px; font-weight:600; margin:0 0 4px; }
+  .addchild-form .hint{ font-size:12px; color:var(--ink-faint); margin:0 0 14px; line-height:1.5; }
+  .addchild-form .warn{ font-size:12px; color:var(--bad); margin:0 0 10px; }
+  .field{ margin-bottom:12px; }
+  .field label{ display:block; font-size:12px; font-weight:600; color:var(--ink-soft); margin-bottom:5px; }
+  .field input[type=text], .field select, .field textarea{
+    width:100%; font:inherit; font-size:13.5px;
+    padding:7px 9px; border:1px solid var(--line); border-radius:7px;
+    background:var(--card); color:var(--ink);
+  }
+  .field textarea{ min-height:72px; resize:vertical; font-family:inherit; line-height:1.5; }
+  .field input:focus, .field select:focus, .field textarea:focus{
+    outline:2px solid var(--accent); outline-offset:1px;
+  }
+  .form-actions{ display:flex; gap:8px; margin-top:14px; }
+
+  .state{
+    max-width:440px;
+    margin-top:10vh;
+    color:var(--ink-soft);
+  }
+  .state h2{ font-family:'Spectral', serif; font-size:20px; color:var(--ink); margin:0 0 8px; }
+  .state p{ margin:0 0 14px; font-size:13.6px; }
+
+  .badges{ display:flex; flex-wrap:wrap; gap:6px; margin-bottom:14px; }
+  .pill{
+    display:inline-flex; align-items:center;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:11px; text-transform:uppercase; letter-spacing:0.04em;
+    padding:3px 8px;
+    border-radius:999px;
+    border:1px solid var(--line);
+    color:var(--ink-soft);
+  }
+  .pill.type{ border-color:var(--accent); color:var(--accent); background:var(--accent-soft); }
+  .pill.status{ border-color:var(--accent-warm); color:var(--accent-warm); background:var(--accent-warm-soft); }
+
+  .detail h2.title{
+    font-family:'Spectral', Georgia, serif;
+    font-weight:600;
+    font-size:30px;
+    margin:0 0 4px;
+    text-wrap:balance;
+  }
+  .detail .iri{
+    font-family:'IBM Plex Mono', monospace;
+    font-size:11.5px;
+    color:var(--ink-faint);
+    word-break:break-all;
+    margin-bottom:18px;
+  }
+  .detail .description{
+    font-size:16px;
+    line-height:1.65;
+    color:var(--ink);
+    border-left:2px solid var(--accent);
+    padding-left:16px;
+    margin:0 0 22px;
+    max-width:62ch;
+  }
+  .detail .description > *:first-child{ margin-top:0; }
+  .detail .description > *:last-child{ margin-bottom:0; }
+  .detail .description p{ margin:0 0 12px; }
+  .detail .description ul, .detail .description ol{ margin:0 0 12px; padding-left:22px; }
+  .detail .description li{ margin-bottom:4px; }
+  .detail .description blockquote{
+    margin:0 0 12px; padding-left:12px;
+    border-left:2px solid var(--line); color:var(--ink-soft);
+  }
+  .detail .description h2, .detail .description h3, .detail .description h4{
+    font-family:'Spectral', Georgia, serif; font-weight:600;
+    margin:0 0 8px; line-height:1.3;
+  }
+  .detail .description code{
+    font-family:'IBM Plex Mono', monospace; font-size:0.9em;
+    background:var(--paper); padding:1px 5px; border-radius:4px;
+  }
+  .detail .description a{ color:var(--accent); }
+  .detail .provenance{
+    font-size:12px;
+    color:var(--ink-faint);
+    margin:0 0 30px;
+  }
+
+  .section-label{
+    font-family:'IBM Plex Mono', monospace;
+    font-size:11px; text-transform:uppercase; letter-spacing:0.08em;
+    color:var(--ink-faint);
+    margin:0 0 10px;
+    padding-bottom:8px;
+    border-bottom:1px solid var(--line);
+  }
+
+  .kv{ display:flex; flex-direction:column; }
+  .kv-row{
+    display:grid;
+    grid-template-columns: 190px 1fr;
+    gap:16px;
+    padding:10px 0;
+    border-bottom:1px solid var(--line);
+    align-items:start;
+  }
+  .kv-row:last-child{ border-bottom:none; }
+  .kv-key{ font-size:12.5px; color:var(--ink-soft); padding-top:2px; }
+  .kv-key.has-tip{ border-bottom:1px dotted var(--ink-faint); cursor:help; }
+  .kv-val{ display:flex; flex-wrap:wrap; gap:6px; min-width:0; }
+  .kv-val .plain{ font-size:13.6px; word-break:break-word; }
+  .kv-val .num{ font-family:'IBM Plex Mono', monospace; font-variant-numeric:tabular-nums; font-size:13.6px; }
+
+  .chip{
+    display:inline-flex; align-items:center; gap:4px;
+    font-size:12.8px;
+    padding:3px 9px 3px 9px;
+    border-radius:999px;
+    border:1px solid var(--accent);
+    background:var(--accent-soft);
+    color:var(--accent);
+    cursor:pointer;
+    font-family:inherit;
+  }
+  .chip:hover{ background:var(--accent); color:#fff; }
+  .chip:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .chip .arrow{ font-size:11px; }
+
+  .ext{
+    font-family:'IBM Plex Mono', monospace;
+    font-size:12px;
+    color:var(--ink-faint);
+    border-bottom:1px dotted var(--ink-faint);
+    cursor:help;
+  }
+
+  .banner{
+    margin:18px 0 0;
+    padding:14px 16px;
+    border-radius:9px;
+    border:1px solid var(--line);
+    background:var(--card);
+    max-width:520px;
+  }
+  .banner.error{ border-color:var(--bad); }
+  .banner h3{ margin:0 0 4px; font-size:14px; }
+  .banner p{ margin:0 0 10px; font-size:13px; color:var(--ink-soft); }
+
+  .skeleton{
+    height:14px; border-radius:4px;
+    background:linear-gradient(90deg, var(--line), var(--paper), var(--line));
+    background-size:200% 100%;
+    animation:shimmer 1.6s infinite;
+    margin-bottom:10px;
+  }
+  @keyframes shimmer{ 0%{background-position:200% 0;} 100%{background-position:-200% 0;} }
+
+  ::-webkit-scrollbar{ width:10px; height:10px; }
+  ::-webkit-scrollbar-thumb{ background:var(--line); border-radius:6px; }
+  ::-webkit-scrollbar-track{ background:transparent; }
+
+  /* Global loading bar -- fixed to the viewport, invisible until
+     #globalProgress carries .active (set for as long as at least one
+     Holonbridge-Workbench call is in flight; see callTool() in the
+     script). Indeterminate sweep, not a real percentage, since the
+     bridge gives no byte-progress signal to report. */
+  #globalProgress{
+    position:fixed; top:0; left:0; right:0; height:3px; z-index:9999;
+    overflow:hidden; background:transparent;
+    opacity:0; transition:opacity 0.15s ease;
+    pointer-events:none;
+  }
+  #globalProgress.active{ opacity:1; }
+  #globalProgress span{
+    position:absolute; top:0; height:100%;
+    background:var(--accent);
+    animation:globalProgressSweep 1.4s cubic-bezier(0.4,0,0.2,1) infinite;
+  }
+  @keyframes globalProgressSweep{
+    0%{ left:-35%; right:100%; }
+    60%{ left:100%; right:-90%; }
+    100%{ left:100%; right:-90%; }
+  }
+</style>
+
+<div id="globalProgress" role="progressbar" aria-label="Loading" aria-valuetext="Loading"><span></span></div>
+
+<div class="app">
+  <header class="topbar">
+    <h1>Holon Navigator</h1>
+    <div class="status" id="connStatus">
+      <span class="dot" id="connDot"></span>
+      <span>connecting…</span>
+    </div>
+    <div class="bridge-picker" id="bridgePicker">
+      <label class="bp-label" for="serverSelect">Connector</label>
+      <select id="serverSelect" class="bp-select" disabled><option>…</option></select>
+      <label class="bp-label" for="bankSelect">Bank</label>
+      <select id="bankSelect" class="bp-select" disabled><option>…</option></select>
+      <label class="bp-label" for="datasetSelect">Dataset</label>
+      <select id="datasetSelect" class="bp-select" disabled><option>…</option></select>
+    </div>
+    <div class="spacer"></div>
+    <div class="count" id="holonCount"></div>
+    <button class="btn" id="refreshBtnTop" type="button" title="Re-query Holonbridge-Workbench for any changes made directly on the graph">&#8635; Refresh</button>
+  </header>
+
+  <div class="layout">
+    <aside class="rail" id="rail">
+      <div class="viewtabs">
+        <select class="view-select" id="viewSelect">
+          <option value="list" selected>All Holons</option>
+          <option value="type">By Type</option>
+          <option value="tree">Containment Tree</option>
+          <option value="taxonomies">Taxonomies</option>
+          <option value="classes">Classes</option>
+          <option value="properties">Properties</option>
+          <option value="nodeshapes">Node Shapes</option>
+          <option value="propshapes">Property Shapes</option>
+          <option value="namespaces">Namespaces</option>
+        </select>
+      </div>
+      <div class="rail-search" id="searchWrap">
+        <input id="search" type="text" placeholder="Filter by name or type…" autocomplete="off">
+      </div>
+      <div class="list" id="list">
+        <div class="list-empty">Loading holons…</div>
+      </div>
+      <div class="list" id="byType" hidden>
+        <div class="list-empty">Loading holons…</div>
+      </div>
+      <div class="tree" id="tree" hidden>
+        <div class="tree-empty">Loading tree…</div>
+      </div>
+      <div class="list" id="taxonomies" hidden>
+        <div class="list-empty">Loading taxonomies…</div>
+      </div>
+      <div class="list" id="classes" hidden>
+        <div class="list-empty">Loading classes…</div>
+      </div>
+      <div class="list" id="properties" hidden>
+        <div class="list-empty">Loading properties…</div>
+      </div>
+      <div class="list" id="nodeShapes" hidden>
+        <div class="list-empty">Loading node shapes…</div>
+      </div>
+      <div class="list" id="propShapes" hidden>
+        <div class="list-empty">Loading property shapes…</div>
+      </div>
+      <div class="list" id="namespaces" hidden>
+        <div class="list-empty">Loading namespaces…</div>
+      </div>
+      <div class="rail-footer">
+        <span class="updated" id="updated"></span>
+        <button class="btn" id="refreshBtn">Refresh</button>
+      </div>
+    </aside>
+
+    <div class="rail-resizer" id="railResizer" role="separator" aria-orientation="vertical"
+         aria-label="Resize sidebar" tabindex="0"></div>
+
+    <main class="detail" id="detail">
+      <div class="detail-inner">
+        <div class="state">
+          <h2>Reaching Holonbridge&#8209;Workbench&hellip;</h2>
+          <p>Switching to the <code>holongraph</code> bank and <code>worldtest</code> dataset, then loading the holon registry.</p>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script>
+(function(){
+  var SERVER = "Holonbridge-Workbench";
+  // Every holon-bridge connector this page knows how to talk to, and the
+  // Bank/Dataset it should land on the moment someone switches to it (the
+  // pair actually reachable on THAT connector's bridge -- Holonbridge-
+  // Workbench's "holongraph" bank/"worldtest" dataset mean nothing to
+  // CS-HB-MCP4's own "local" bank, and vice versa). onServerChange() reads
+  // this to reset BANK/DATASET before reconnecting; a connector added here
+  // later also needs an entry in the published artifact's
+  // capabilities.mcp.servers manifest, or its calls will be refused.
+  var CONNECTORS = {
+    "Holonbridge-Workbench": {bank: "holongraph", dataset: "worldtest"},
+    "CS-HB-MCP4": {bank: "local", dataset: "acmeco"}
+  };
+  // BANK/DATASET/HOLONS_GRAPH/ONTOLOGY_GRAPH/SHACL_GRAPH/HOME_IRI are all
+  // mutable, not fixed constants -- "worldtest" on the "holongraph" bank is
+  // only the STARTING point. enterDataset() (added 2026-09-15, alongside
+  // the Bank/Dataset pickers in the topbar) reassigns every one of these
+  // after a switch: the three graph IRIs come straight back from
+  // get_endpoint()'s own `graphs` map rather than being re-derived by
+  // string-pattern here, since a different bank's server could in
+  // principle name them differently even though every bank observed so
+  // far (holongraph: worldtest, apas) follows the same
+  // "urn:holongraph:{dataset}:{holons|ontology|shacl}" convention; HOME_IRI
+  // is resolved per-dataset by querying for a holon:Home instance in the
+  // (now-current) holons graph -- see homeQuery() and enterDataset() below.
+  // A dataset with no holon:Home yet is "unbound": enterDataset() detects
+  // that and offers to mint one instead of trying to boot the rest of the
+  // app against a dataset with nothing in it to show.
+  var BANK = "holongraph";
+  var DATASET = "worldtest";
+  var HOLONS_GRAPH = "urn:holongraph:worldtest:holons";
+  var ONTOLOGY_GRAPH = "urn:holongraph:worldtest:ontology";
+  var SHACL_GRAPH = "urn:holongraph:worldtest:shacl";
+  var HOLON_CLASS = "https://w3id.org/holon/Holon";
+  var HOME_IRI = null;
+  // Bumped at the start of every enterDataset() call; a stale async
+  // callback (a watchTool event or a promise chain) that captured an
+  // earlier generation number checks it before touching shared state or
+  // the DOM, so a fast double-switch (or a switch fired while a slow
+  // request from the PREVIOUS dataset is still in flight) can't have the
+  // old dataset's data clobber the new dataset's already-rendered view.
+  var datasetGeneration = 0;
+
+  // Global "loading" indicator -- the slim bar fixed to the top of the
+  // viewport (#globalProgress, styled above). Rather than instrument each
+  // of the ~50 call sites that talk to Holonbridge-Workbench individually,
+  // every one of them calls callTool() below instead of mcp.callTool()
+  // directly; callTool() is a drop-in wrapper with the same signature and
+  // return value, so it needs no changes to any existing .then()/.catch()
+  // chain. activeRequests counts calls in flight (not sub-second-fast
+  // single lookups specifically, but ANY bridge call: tree expansion, a
+  // detail load, a save, a dataset switch) so two overlapping calls don't
+  // let the bar disappear after only the first one finishes.
+  var activeRequests = 0;
+  var $globalProgress = document.getElementById('globalProgress');
+  function beginLoad(){
+    activeRequests++;
+    if ($globalProgress) $globalProgress.classList.add('active');
+  }
+  function endLoad(){
+    activeRequests = Math.max(0, activeRequests - 1);
+    if (activeRequests === 0 && $globalProgress) $globalProgress.classList.remove('active');
+  }
+  function callTool(server, tool, args){
+    beginLoad();
+    return mcp.callTool(server, tool, args).then(
+      function(res){ endLoad(); return res; },
+      function(err){ endLoad(); throw err; }
+    );
+  }
+
+  var STATUS_PREDICATE = "https://w3id.org/holon/status";
+  // Deprecation reuses the same holon:status predicate this dataset already
+  // puts on holons (holon:RegisteredStatus, holon:ConsumedStatus, and
+  // holon:TombstonedStatus for a retired holon) -- holon:DeprecatedStatus is
+  // a new individual in that same family, applied to a skos:Concept or
+  // skos:ConceptScheme instead. Like the existing status values, it needs
+  // no formal ontology declaration of its own (none of the others have
+  // one either); it's just a value this viewer recognises.
+  //
+  // STATUS_PREDICATE and DEPRECATED_STATUS_IRI are declared up here,
+  // ahead of DEPRECATED_SET_QUERY below, rather than down near the other
+  // status/predicate constants -- this script runs top-to-bottom as one
+  // IIFE, and DEPRECATED_SET_QUERY's string concatenation needs both
+  // already assigned at the time it runs, not just hoisted as `var`
+  // declarations. Moved 2026-09-12 after finding they'd been declared
+  // (and correctly used everywhere else) far below this point, so every
+  // build of DEPRECATED_SET_QUERY was silently baking in the literal text
+  // "<undefined>" for both -- a query that can never match anything,
+  // which is why deprecatedSet always came back empty and no Deprecate/
+  // Reactivate toggle, anywhere in the app, ever visibly did anything.
+  var DEPRECATED_STATUS_IRI = "https://w3id.org/holon/DeprecatedStatus";
+  // Containment for the tree view: holon:isPartOf is the generic holon
+  // relation; geo:administrativePartOf is a genuine rdfs:subPropertyOf it
+  // (Continent -> Country -> City) but the dataset carries no RDFS
+  // entailment, so both are named explicitly via a property path.
+  var ISPARTOF_PREDICATE = "https://w3id.org/holon/isPartOf";
+  var ADMIN_PARTOF_PREDICATE = "https://w3id.org/data/ontology/geography#administrativePartOf";
+  var PART_OF_PATH = "<" + ISPARTOF_PREDICATE + ">|<" + ADMIN_PARTOF_PREDICATE + ">";
+
+  // geo:administrativePartOf's own rdfs:comment in the ontology graph is
+  // explicit: "Spatial/administrative containment in the Continent ->
+  // Country -> City sense, as distinct from holon:isPartOf's orbital-system
+  // sense". These are the classes that chain participates in -- confirmed
+  // empirically (2026-09-14) against every pre-existing containment triple
+  // between two of them (22 Continent->Country, 32 City->Country/
+  // ConstituentCountry, 7 District->City -- zero counterexamples) before
+  // adding FederatedState, which no instance yet occupies but whose own
+  // SHACL shape (FederatedStateShape's isContiguousWith) already groups it
+  // with Country/ConstituentCountry in the same administrative family.
+  var GEO_ADMIN_PLACE_KINDS = [
+    "https://w3id.org/data/ontology/geography#Continent",
+    "https://w3id.org/data/ontology/geography#Country",
+    "https://w3id.org/data/ontology/geography#ConstituentCountry",
+    "https://w3id.org/data/ontology/geography#FederatedState",
+    "https://w3id.org/data/ontology/geography#District",
+    "https://w3id.org/data/ontology/geography#City"
+  ];
+  function isGeoAdminPlaceKind(types){
+    return (types || []).some(function(t){ return GEO_ADMIN_PLACE_KINDS.indexOf(t) !== -1; });
+  }
+  // The single place that decides which containment predicate a NEW
+  // isPartOf-style link should use: geo:administrativePartOf when both
+  // ends are geography admin place-kinds, holon:isPartOf otherwise (the
+  // orbital-system sense -- Moon->Planet -- and everything non-geographic).
+  // Added 2026-09-14 after Kurt caught several interface-created holons
+  // (Greece/Poland/The Netherlands/India under their continents; Warsaw/
+  // Beijing/Amsterdam/Brussels/Swansea under their countries) carrying the
+  // generic predicate while every hand-authored instance of the same
+  // Continent->Country->City chain used the specific one. Every creation
+  // path (buildCreateTurtle, Add Child's "attach existing", the Parent/
+  // Child Holon(s) relationship fields) now calls this instead of each one
+  // separately hardcoding ISPARTOF_PREDICATE, so the choice stays
+  // consistent everywhere a containment link gets minted.
+  function containmentPredicateFor(parentTypes, childTypes){
+    return (isGeoAdminPlaceKind(parentTypes) && isGeoAdminPlaceKind(childTypes))
+      ? ADMIN_PARTOF_PREDICATE
+      : ISPARTOF_PREDICATE;
+  }
+  function typesOfIri(targetIri){
+    var h = holons.find(function(x){ return x.iri === targetIri; });
+    return h ? h.types : [];
+  }
+  // Connections for the tree view: holon:isConnectedTo is the generic,
+  // symmetric, non-containment counterpart to holon:isPartOf (see the
+  // comment on connectionsQuery below) -- every domain-specific relation
+  // that participates in it (geo:crosses, holon:affiliation,
+  // worldtest:headquarters, ...) declares itself as rdfs:subPropertyOf it
+  // in the ontology graph, with no entailment active, so connectionsQuery
+  // walks that chain itself via a property path rather than hardcoding
+  // any domain-specific predicate name.
+  var IS_CONNECTED_TO_PREDICATE = "https://w3id.org/holon/isConnectedTo";
+
+  // The full family of containment predicates THIS dataset actually uses --
+  // every ?p with ?p rdfs:subPropertyOf* holon:isPartOf in the ontology
+  // graph, discovered live rather than assumed. Added 2026-09-15 after
+  // switching this viewer to browse datasets beyond worldtest exposed a real
+  // bug: the Containment Tree and the detail panel's Parent/Child Holon(s)
+  // fields both hardcoded exactly PART_OF_PATH's two names (holon:isPartOf,
+  // geo:administrativePartOf), so bridgerton -- whose entire org-unit tree
+  // runs on sl:isPartOfOrg, a genuine rdfs:subPropertyOf holon:isPartOf that
+  // simply isn't either of those two IRIs -- showed a League with clubs but
+  // every club showing zero children, since Team/Board->Club links use only
+  // sl:isPartOfOrg. get_holon's own neighbourhood queries never had this bug
+  // (they always discovered the family live); the tree/detail queries below
+  // now do the same rather than hardcoding a fixed list. Cached per dataset
+  // (cleared in resetDatasetState) since it's ontology-wide schema info, not
+  // per-holon, like loadInverseNames/loadEnumSchemes/loadDeprecatedSet.
+  var PART_OF_PREDICATES_QUERY = [
+    "PREFIX holon: <https://w3id.org/holon/>",
+    "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>",
+    "SELECT DISTINCT ?p WHERE { ?p rdfs:subPropertyOf* holon:isPartOf }"
+  ].join("\n");
+  var partOfPredicatesPromise = null;
+
+  function loadPartOfPredicates(){
+    if (!partOfPredicatesPromise){
+      partOfPredicatesPromise = callTool(SERVER, 'sparql_select', {query: PART_OF_PREDICATES_QUERY, graph: ONTOLOGY_GRAPH})
+        .then(function(res){
+          var bindings = (res.payload && res.payload.results && res.payload.results.bindings) || [];
+          var set = {};
+          bindings.forEach(function(b){ set[b.p.value] = true; });
+          set[ISPARTOF_PREDICATE] = true;   // always counts, even with zero ontology declarations
+          return set;
+        })
+        .catch(function(){
+          var fallback = {};
+          fallback[ISPARTOF_PREDICATE] = true;
+          fallback[ADMIN_PARTOF_PREDICATE] = true;
+          return fallback;
+        });
+    }
+    return partOfPredicatesPromise;
+  }
+
+  // ORDER BY LCASE(STR(?label)), not ORDER BY ?label: Jena orders RDF
+  // terms by kind before value, so every plain-literal label (the older
+  // holons, "Africa") sorted ahead of every language-tagged one (anything
+  // created since labels became "..."@en, "Antarctica"@en) -- which is why
+  // new holons always landed in a second alphabetical run at the bottom of
+  // the All Holons list. It was also case-sensitive ("the Eiffel Tower"
+  // after "Wren"). Sorting on the lowercased lexical form ignores both.
+  // loadList() re-sorts client-side with localeCompare as well, so the
+  // list order never depends on the endpoint's collation.
+  var LIST_QUERY = [
+    "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>",
+    "SELECT ?holon ?label (GROUP_CONCAT(DISTINCT STR(?type); separator=\"|\") AS ?types) WHERE {",
+    "  ?holon a <" + HOLON_CLASS + "> ; rdfs:label ?label .",
+    "  OPTIONAL { ?holon a ?type . FILTER(?type != <" + HOLON_CLASS + ">) }",
+    "} GROUP BY ?holon ?label ORDER BY LCASE(STR(?label))"
+  ].join("\n");
+
+  function detailQuery(iri){
+    return "SELECT ?p ?o WHERE { <" + iri + "> ?p ?o }";
+  }
+
+  // The inverse of detailQuery -- every holon that points AT `iri`, via
+  // any predicate. Left ungrouped (unlike LIST_QUERY/childrenQuery's
+  // GROUP_CONCAT pattern) because loadReferences groups these client-side
+  // by PREDICATE, not by subject -- mirroring how the Properties kv list
+  // groups values under one key, so several referencing holons that share
+  // a predicate (e.g. several Members of the same Organization) render as
+  // one row with several chips, not one row each.
+  function referencesQuery(iri){
+    return [
+      "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>",
+      "SELECT ?s ?p ?label WHERE {",
+      "  ?s ?p <" + iri + "> ; a <" + HOLON_CLASS + "> ; rdfs:label ?label .",
+      "}"
+    ].join("\n");
+  }
+
+  // Every sh:inverseName ever declared on a property shape, keyed by the
+  // property's sh:path -- this is a custom annotation (not core SHACL) this
+  // dataset uses to give the inverse of a directed relation a proper name
+  // (e.g. holon:affiliation's forward name is "Affiliation"; its
+  // inverseName is "Member"), consumed only by the References section. A
+  // predicate with several property-shape declarations (one per targetClass)
+  // is expected to carry the same inverseName on all of them; first value
+  // seen wins if they ever disagree. Loaded once and cached for the session,
+  // like loadShapeTargetClasses/loadClassHierarchy -- it's dataset-wide
+  // schema metadata, not per-holon.
+  var INVERSE_NAME_QUERY = [
+    "PREFIX sh: <http://www.w3.org/ns/shacl#>",
+    "SELECT ?path ?inverseName WHERE {",
+    "  ?shape sh:property ?prop .",
+    "  ?prop sh:path ?path ; sh:inverseName ?inverseName .",
+    "}"
+  ].join("\n");
+  var inverseNamesPromise = null;
+
+  function loadInverseNames(){
+    if (!inverseNamesPromise){
+      inverseNamesPromise = callTool(SERVER, 'sparql_select', {query: INVERSE_NAME_QUERY, graph: SHACL_GRAPH})
+        .then(function(res){
+          var bindings = (res.payload && res.payload.results && res.payload.results.bindings) || [];
+          var map = {};
+          bindings.forEach(function(b){ if (!map[b.path.value]) map[b.path.value] = b.inverseName.value; });
+          return map;
+        })
+        .catch(function(){ return {}; });
+    }
+    return inverseNamesPromise;
+  }
+
+  // Which sh:in-enumerated property paths are backed by a real SKOS
+  // taxonomy (a skos:ConceptScheme in the ontology graph), and which
+  // scheme. Not every sh:in field qualifies -- holon:controllerType's list
+  // is plain string literals, and schema:healthStatus's IRIs carry no
+  // skos:Concept typing or skos:inScheme -- so this is discovered per-path
+  // by checking whether the *existing* sh:in values actually resolve to a
+  // skos:Concept, rather than assumed from the control type. Only a path
+  // that comes back with a scheme here gets the "+ New value" affordance in
+  // the shape-driven property editor, since only for those is "create a new
+  // one" a well-defined operation (mint a concept in that scheme, then
+  // splice it into every sh:in list sharing this path -- see
+  // buildAppendConceptToInSparql). Loaded once and cached for the session,
+  // like loadInverseNames/loadShapeTargetClasses.
+  var ENUM_SCHEME_QUERY = [
+    "PREFIX sh: <http://www.w3.org/ns/shacl#>",
+    "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>",
+    "PREFIX skos: <http://www.w3.org/2004/02/skos/core#>",
+    // Jena's ARQ rejects aggregating a variable into an output of the same
+    // name (?scheme -> (SAMPLE(?scheme) AS ?scheme) is a parse error --
+    // "Variable used when already in-scope") -- ?schemeOut sidesteps that.
+    "SELECT ?path (SAMPLE(?scheme) AS ?schemeOut) WHERE {",
+    "  GRAPH <" + SHACL_GRAPH + "> {",
+    "    ?shape sh:property ?prop .",
+    "    ?prop sh:path ?path ; sh:in ?inList .",
+    "    ?inList rdf:rest*/rdf:first ?inVal .",
+    "  }",
+    "  GRAPH <" + ONTOLOGY_GRAPH + "> {",
+    "    ?inVal a skos:Concept ; skos:inScheme ?scheme .",
+    "  }",
+    "} GROUP BY ?path"
+  ].join("\n");
+  var enumSchemesPromise = null;
+
+  function loadEnumSchemes(){
+    if (!enumSchemesPromise){
+      enumSchemesPromise = callTool(SERVER, 'sparql_select', {query: ENUM_SCHEME_QUERY})
+        .then(function(res){
+          var bindings = (res.payload && res.payload.results && res.payload.results.bindings) || [];
+          var map = {};
+          bindings.forEach(function(b){ map[b.path.value] = b.schemeOut.value; });
+          return map;
+        })
+        .catch(function(){ return {}; });
+    }
+    return enumSchemesPromise;
+  }
+
+  // The namespace a new concept for this path's enum should be minted
+  // under -- derived from an existing sh:in value's own IRI (everything up
+  // to its last "/") rather than hardcoded per-predicate, so this keeps
+  // working if a scheme's namespace ever changes or a new SKOS-backed enum
+  // is added later.
+  function conceptNamespaceFor(existingIri){
+    var idx = existingIri.lastIndexOf('/');
+    return idx === -1 ? existingIri : existingIri.slice(0, idx + 1);
+  }

@@ -1,0 +1,92 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style>
+<link rel="stylesheet" href="styles.css">
+</head><body>
+<div id="globalProgress" role="progressbar" aria-label="Loading" aria-valuetext="Loading"><span></span></div>
+
+<div class="app">
+  <header class="topbar">
+    <h1>Holon Navigator</h1>
+    <div class="status" id="connStatus">
+      <span class="dot" id="connDot"></span>
+      <span>connecting…</span>
+    </div>
+    <div class="bridge-picker" id="bridgePicker">
+      <label class="bp-label" for="serverSelect">Connector</label>
+      <select id="serverSelect" class="bp-select" disabled><option>…</option></select>
+      <label class="bp-label" for="bankSelect">Bank</label>
+      <select id="bankSelect" class="bp-select" disabled><option>…</option></select>
+      <label class="bp-label" for="datasetSelect">Dataset</label>
+      <select id="datasetSelect" class="bp-select" disabled><option>…</option></select>
+    </div>
+    <div class="spacer"></div>
+    <div class="count" id="holonCount"></div>
+    <button class="btn" id="refreshBtnTop" type="button" title="Re-query Holonbridge-Workbench for any changes made directly on the graph">&#8635; Refresh</button>
+  </header>
+
+  <div class="layout">
+    <aside class="rail" id="rail">
+      <div class="viewtabs">
+        <select class="view-select" id="viewSelect">
+          <option value="list" selected>All Holons</option>
+          <option value="type">By Type</option>
+          <option value="tree">Containment Tree</option>
+          <option value="taxonomies">Taxonomies</option>
+          <option value="classes">Classes</option>
+          <option value="properties">Properties</option>
+          <option value="nodeshapes">Node Shapes</option>
+          <option value="propshapes">Property Shapes</option>
+          <option value="namespaces">Namespaces</option>
+        </select>
+      </div>
+      <div class="rail-search" id="searchWrap">
+        <input id="search" type="text" placeholder="Filter by name or type…" autocomplete="off">
+      </div>
+      <div class="list" id="list">
+        <div class="list-empty">Loading holons…</div>
+      </div>
+      <div class="list" id="byType" hidden>
+        <div class="list-empty">Loading holons…</div>
+      </div>
+      <div class="tree" id="tree" hidden>
+        <div class="tree-empty">Loading tree…</div>
+      </div>
+      <div class="list" id="taxonomies" hidden>
+        <div class="list-empty">Loading taxonomies…</div>
+      </div>
+      <div class="list" id="classes" hidden>
+        <div class="list-empty">Loading classes…</div>
+      </div>
+      <div class="list" id="properties" hidden>
+        <div class="list-empty">Loading properties…</div>
+      </div>
+      <div class="list" id="nodeShapes" hidden>
+        <div class="list-empty">Loading node shapes…</div>
+      </div>
+      <div class="list" id="propShapes" hidden>
+        <div class="list-empty">Loading property shapes…</div>
+      </div>
+      <div class="list" id="namespaces" hidden>
+        <div class="list-empty">Loading namespaces…</div>
+      </div>
+      <div class="rail-footer">
+        <span class="updated" id="updated"></span>
+        <button class="btn" id="refreshBtn">Refresh</button>
+      </div>
+    </aside>
+
+    <div class="rail-resizer" id="railResizer" role="separator" aria-orientation="vertical"
+         aria-label="Resize sidebar" tabindex="0"></div>
+
+    <main class="detail" id="detail">
+      <div class="detail-inner">
+        <div class="state">
+          <h2>Reaching Holonbridge&#8209;Workbench&hellip;</h2>
+          <p>Switching to the <code>holongraph</code> bank and <code>worldtest</code> dataset, then loading the holon registry.</p>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script src="dist/app.js"></script>
+</body></html>

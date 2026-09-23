@@ -237,6 +237,47 @@ def _admin_role(holons_graph: str) -> str:
     return holons_graph[: -len(suffix)] + ":role:admin"
 
 
+def _scratch_area(holons_graph: str) -> str:
+    """The reserved scratch-area IRI for this dataset, derived the same way
+    ``_admin_role`` derives the admin role: swap the trailing ``:holons``
+    for the resource's own path segment -- ``urn:bridgerton:holons`` ->
+    ``urn:bridgerton:scratch``. Individual scratch graphs are named
+    ``{scratch_area}:{token}`` (a UUID, typically); this resource is what a
+    namespace-level ``holon:grantsWrite``/``holon:grantsReplace`` targets,
+    never a data graph in its own right.
+
+    Added 2026-09-23 on Kurt's framing: a scratch workspace needs to be
+    fast and low-ceremony -- generated for a calculation or simulation,
+    used, and generally cleared when done -- but a freshly-minted scratch
+    graph, named from a UUID generated at write time, can never have a
+    pre-existing per-graph grant naming it. Left unchanged, the ordinary
+    check_write/check_replace per-target lookup would deny every non-admin
+    write to a brand-new scratch graph outright, which is worse than
+    ordinary graphs, not equally gated. One grant on this namespace
+    resource, checked instead of one on the graph itself whenever the
+    target falls under it (see ``is_scratch_graph``), is what makes
+    scratch usable without abandoning "no default-permit" -- still a real
+    grant, still fail-closed absent one, just resolved once at the
+    namespace level rather than per minted graph.
+    """
+    suffix = ":holons"
+    if not holons_graph.endswith(suffix):
+        raise ValueError(f"expected holons_graph to end with {suffix!r}, got {holons_graph!r}")
+    return holons_graph[: -len(suffix)] + ":scratch"
+
+
+def is_scratch_graph(target: str, holons_graph: str) -> bool:
+    """Whether ``target`` falls under this dataset's scratch namespace --
+    ``{scratch_area}:{token}``, e.g. ``urn:bridgerton:scratch:<uuid>``.
+
+    The scratch-area resource itself (with no trailing token) does not
+    count as a scratch graph -- it is a grant target for check_write/
+    check_replace to resolve against, never a data graph written to
+    directly.
+    """
+    return target.startswith(_scratch_area(holons_graph) + ":")
+
+
 async def is_admin(query_fn: QueryFn, holons_graph: str, *, person: str) -> bool:
     """Whether ``person`` holds the reserved admin Role for this dataset."""
     query = f"""
@@ -254,7 +295,14 @@ async def is_admin(query_fn: QueryFn, holons_graph: str, *, person: str) -> bool
 # All share one shape: check admin first (unconditional bypass), then
 # either an individual override or an explicit grant. Absence of a grant is
 # a denial, never an allow -- there is no default-permit path anywhere in
-# this module below the admin bypass.
+# this module below the admin bypass, with one narrow, deliberate
+# carve-out: check_write/check_replace resolve a scratch-namespaced target
+# (see is_scratch_graph) to a single namespace-level grant target rather
+# than the graph itself, so one grant on a dataset's scratch area covers
+# every scratch graph a person creates under it, present or future. Still a
+# real grant, still fail-closed absent one -- see _scratch_area's own
+# comment for why a per-graph grant is structurally impossible for
+# something minted fresh at write time.
 
 async def _denied_by_override(
     query_fn: QueryFn, holons_graph: str, *, target: str, person: str
@@ -323,21 +371,37 @@ async def check_write(
     """May ``person`` write (append/merge) to ``target``? Never via an
     ordinary Role grant -- see the read/write asymmetry in the DataBook --
     and the admin bypass is the sole deliberate exception to that.
-    Otherwise only an explicit holon:grantsWrite naming this exact
-    (person, target) pair allows it. This governs additive/merge writes
-    only -- see check_replace for wholesale graph overwrite, which is
-    deliberately a stricter, independent grant."""
+    Otherwise only an explicit holon:grantsWrite allows it: naming this
+    exact (person, target) pair for an ordinary graph, or naming
+    (person, scratch-area) when ``is_scratch_graph`` recognises ``target``
+    as falling under this dataset's scratch namespace -- see
+    ``_scratch_area`` for why a scratch graph, minted fresh at write time,
+    could never have a grant naming it specifically. This governs
+    additive/merge writes only -- see check_replace for wholesale graph
+    overwrite, which is deliberately a stricter, independent grant."""
     if await is_admin(query_fn, holons_graph, person=person):
         return AclDecision(True, "admin role bypass", person)
+    grant_target = (
+        _scratch_area(holons_graph) if is_scratch_graph(target, holons_graph) else target
+    )
     query = f"""
     PREFIX holon: <{HOLON}>
     ASK {{
-      GRAPH <{holons_graph}> {{ <{target}> holon:grantsWrite <{person}> . }}
+      GRAPH <{holons_graph}> {{ <{grant_target}> holon:grantsWrite <{person}> . }}
     }}
     """
     result = await _run(query_fn, query)
     if result.get("boolean"):
-        return AclDecision(True, "explicit grantsWrite", person, target)
+        reason = (
+            "namespace-level grantsWrite on the scratch area"
+            if grant_target != target
+            else "explicit grantsWrite"
+        )
+        return AclDecision(True, reason, person, grant_target)
+    if grant_target != target:
+        return AclDecision(
+            False, "writes are never role-based; no grantsWrite on the scratch area", person
+        )
     return AclDecision(False, "writes are never role-based; no explicit grantsWrite found", person)
 
 
@@ -352,22 +416,45 @@ async def check_replace(
     contribution to a shared graph in one call must never be implied by an
     ordinary holon:grantsWrite. Deliberately a separate predicate, not a
     stronger reading of the same one -- holding grantsWrite for a graph
-    confers nothing here, by design, and as of this writing nothing in any
-    dataset holds grantsReplace at all, which is the intended starting
-    state (appends available by default, replace available to no one until
-    someone deliberately decides otherwise), not an oversight to backfill.
-    Same admin bypass, same fail-closed default as check_write."""
+    confers nothing here, by design.
+
+    Same scratch-area carve-out as check_write (see
+    ``_scratch_area``/``is_scratch_graph``): a namespace-level
+    grantsReplace on the scratch area covers every scratch graph, since a
+    freshly-minted one can never hold a grant naming it specifically --
+    still fail-closed, still a real grant, just resolved to the namespace
+    for scratch targets. As of this writing nothing in any dataset holds
+    grantsReplace at all -- not even on a scratch area -- which is the
+    intended starting state (appends available by default, replace
+    available to no one until someone deliberately decides otherwise), not
+    an oversight to backfill. Same admin bypass, same fail-closed default
+    as check_write."""
     if await is_admin(query_fn, holons_graph, person=person):
         return AclDecision(True, "admin role bypass", person)
+    grant_target = (
+        _scratch_area(holons_graph) if is_scratch_graph(target, holons_graph) else target
+    )
     query = f"""
     PREFIX holon: <{HOLON}>
     ASK {{
-      GRAPH <{holons_graph}> {{ <{target}> holon:grantsReplace <{person}> . }}
+      GRAPH <{holons_graph}> {{ <{grant_target}> holon:grantsReplace <{person}> . }}
     }}
     """
     result = await _run(query_fn, query)
     if result.get("boolean"):
-        return AclDecision(True, "explicit grantsReplace", person, target)
+        reason = (
+            "namespace-level grantsReplace on the scratch area"
+            if grant_target != target
+            else "explicit grantsReplace"
+        )
+        return AclDecision(True, reason, person, grant_target)
+    if grant_target != target:
+        return AclDecision(
+            False,
+            "replace is stricter than write; no grantsReplace on the scratch area "
+            "(holding grantsWrite there does not imply it)",
+            person,
+        )
     return AclDecision(
         False,
         "replace is stricter than write; no explicit grantsReplace found "

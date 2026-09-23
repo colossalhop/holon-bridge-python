@@ -3,7 +3,10 @@
 ``get_endpoint`` needs read access to the dataset/bank override state, so
 this module imports ``session`` itself (not just ``mcp``/``_call``) --
 see ``session.py``'s own docstring for why that has to be a qualified
-``session.X`` access rather than a plain name import.
+``session.X`` access rather than a plain name import, and for the
+2026-09-23 change from one override per process to one per caller
+identity (``get_endpoint`` now reports your own override, not a value
+every caller shares).
 """
 
 from __future__ import annotations
@@ -18,19 +21,28 @@ async def get_endpoint() -> dict:
 
     Also reports the MCP layer's own dataset override state — deliberately
     prominent, because a wrong-dataset write with no warning is the specific
-    failure this has caused before. ``datasetOverride`` is the switch this
-    MCP process currently applies (empty if none); ``datasetOverrideSource``
-    is ``env`` (from ``HOLONBRIDGE_DATASET``), ``persisted`` (restored from a
-    prior session after a restart), ``explicit`` (set by ``switch_dataset``
-    in this session), or ``none``. Worth checking with this tool before a
-    write, and especially right after any restart — a persisted override
-    means the switch survived, but it is still worth confirming rather than
-    assuming.
+    failure this has caused before. ``datasetOverride`` is the switch *you*
+    currently apply (empty if none); ``datasetOverrideSource`` is ``env``
+    (from ``HOLONBRIDGE_DATASET``), ``persisted`` (restored from a prior
+    session of yours after a restart), ``explicit`` (set by your own
+    ``switch_dataset`` call in this session), or ``none``. Worth checking
+    with this tool before a write, and especially right after any restart —
+    a persisted override means your switch survived, but it is still worth
+    confirming rather than assuming.
+
+    Since 2026-09-23 this override is scoped to your own identity: a
+    colleague reaching this same running process under a different identity
+    can correctly get a different answer from this same call, made at the
+    same moment. Before that change every caller through one process shared
+    a single answer, which meant one person's earlier switch could silently
+    be the reason a completely different person's write landed somewhere
+    unexpected.
 
     ``bankOverride`` and ``bankOverrideSource`` report the same thing for the
-    bank — the named backend connection this process is pointed at. Both are
-    reported because they fail the same silent way: the call succeeds, the
-    data is simply not where you thought it was.
+    bank — the named backend connection your own calls are pointed at, same
+    per-identity scoping as the dataset override. Both are reported because
+    they fail the same silent way: the call succeeds, the data is simply not
+    where you thought it was.
 
     Also reports ``personaOverride``/``personaOverrideSource`` — your
     active persona for the current dataset, same values as ``whoami``.
@@ -40,10 +52,10 @@ async def get_endpoint() -> dict:
     """
     result = await _call("GET", "/endpoint")
     if isinstance(result, dict) and not result.get("error"):
-        result["datasetOverride"] = session._dataset_override
-        result["datasetOverrideSource"] = session._dataset_override_source
-        result["bankOverride"] = session._bank_override
-        result["bankOverrideSource"] = session._bank_override_source
+        result["datasetOverride"] = session.current_dataset_override()
+        result["datasetOverrideSource"] = session.current_dataset_override_source()
+        result["bankOverride"] = session.current_bank_override()
+        result["bankOverrideSource"] = session.current_bank_override_source()
     return result
 
 

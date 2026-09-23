@@ -12,19 +12,44 @@ that depend on it don't all have to live in the same file to reach it.
 Tool modules import ``mcp`` and ``_call`` directly (both are stable
 references, never reassigned). A tool that needs to read or write the
 dataset/bank override state imports this module itself
-(``from .. import session``) and accesses ``session._dataset_override``
-etc. by qualified attribute, not via ``from .session import
-_dataset_override`` -- the latter would bind the value at import time and
-go stale the moment ``switch_dataset`` reassigns it elsewhere. See
-``tools/datasets.py`` and ``tools/banks.py`` for the two places that
-matters, and ``tools/core.py``'s ``get_endpoint`` for a read-only case
-of the same thing.
+(``from .. import session``) and calls ``session.current_dataset_override()``
+/ ``session.set_dataset_override(...)`` etc. (and the bank equivalents) --
+never reaches into ``_dataset_overrides``/``_bank_overrides`` directly.
+See ``tools/datasets.py`` and ``tools/banks.py`` for the two places that
+matters, and ``tools/core.py``'s ``get_endpoint`` for a read-only case of
+the same thing.
+
+CHANGED 2026-09-23: dataset/bank override state went from one value per
+process to one value per caller identity, keyed by
+``identity.current_github_login``. Previously ``_dataset_override`` (and
+``_bank_override``) were plain module-level strings -- genuinely global,
+so a second person's client talking to the same running process saw and
+was affected by the first person's ``switch_dataset`` call, with no
+warning to either of them. Confirmed live as a real, not hypothetical,
+risk once more than one person could reasonably be expected to share a
+running holonbridge-mcp process (Kurt's framing: "I can definitely see
+multiple people working on the MCP simultaneously"). Fixed by keying
+everything on ``current_github_login.get()`` -- see that ContextVar's own
+docstring in ``identity.py`` for why it is already scoped at exactly the
+right granularity (set once per SSE connection, correctly inherited by
+every tool call the session makes afterward) without this module needing
+to invent its own session tracking. ``None`` -- the shared-token auth
+mode, where the docstring there says plainly "there is no way to tell
+callers apart" -- is a legitimate dict key like any other login string,
+so that deployment mode collapses back to exactly today's shared-global
+behaviour automatically, with no special-casing required: there genuinely
+is no finer granularity available to it.
+
+This does NOT fix write collisions between two people editing the same
+graph -- that is a real, separate concern (see ``holonbridge.acl``'s
+grant model) outside what dataset/bank *selection* can address at all.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -41,140 +66,271 @@ load_shared_env()
 
 BRIDGE_URL = os.getenv("HOLONBRIDGE_URL", "http://localhost:3031").rstrip("/")
 BEARER = os.getenv("BEARER_TOKEN", "")
-# Mutable: switch_dataset changes this for the life of the process. Module
-# state rather than a per-call argument because switching is a session
-# gesture ("now I am working on bridgerton"), not something to repeat on
-# every tool. The cost is that it is genuinely global — a second client
-# against the same process sees the switch too. Fine for one operator and
-# their own tunnel, which is what this is; not fine for shared hosting.
+
+
+def _safe_filename_component(login: str) -> str:
+    """A login string, made safe as a filename suffix. Logins are GitHub
+    usernames in practice (alphanumeric plus hyphens), but this makes no
+    assumption beyond "don't let it escape the intended directory or
+    collide with the separator" -- anything else is replaced, not rejected,
+    since a slightly-mangled-but-still-unique filename is fine here and a
+    thrown exception on a weird identity string is not."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", login)
+
+
+# --------------------------------------------------------------------------
+# Dataset override -- one per caller identity, not one per process.
+# --------------------------------------------------------------------------
 #
-# Persisted, not just held in memory. The failure this fixes happened live,
-# twice: a chosen dataset survives fine within a session, but an MCP process
+# Module state rather than a per-call argument because switching is a
+# session gesture ("now I am working on bridgerton"), not something to
+# repeat on every tool -- see current_dataset_override()'s own note on why
+# keying by current_github_login.get() gives every identity its own
+# independent version of that gesture, in the same two dicts, rather than
+# needing separate module-level variables per identity (which would be
+# unbounded and pointless to declare in advance).
+#
+# Persisted, not just held in memory, same reasoning as before this
+# change: a chosen dataset survives fine within a session, but a process
 # restart used to silently fall back to whatever HOLONBRIDGE_DATASET (or
-# nothing) said at import time — which meant a write immediately after a
-# restart landed in the wrong dataset with no error and no warning, because
-# nothing was watching for that specific kind of drift. A real env var still
-# wins over the persisted file, matching how .env itself behaves — an
-# explicit HOLONBRIDGE_DATASET is a deliberate pin, not a stale leftover.
+# nothing) said at import time -- which meant a write immediately after a
+# restart could land in the wrong dataset with no error and no warning.
+# Now per-identity: each person's own persisted file, loaded lazily the
+# first time that identity is seen rather than all pre-loaded at import
+# (the set of identities that will ever connect isn't known at import
+# time). A real HOLONBRIDGE_DATASET env var still wins over any persisted
+# file, for any identity, matching how .env itself behaves -- an explicit
+# env var is a deliberate operator-level pin, not a per-user preference,
+# so it is intentionally NOT keyed by identity at all.
+
+_ENV_DATASET = os.getenv("HOLONBRIDGE_DATASET", "").strip()
+
 _DATASET_STATE_FILE = Path(
     os.getenv("HOLONBRIDGE_DATASET_STATE_FILE", "")
     or (Path.home() / ".holonbridge" / "mcp-dataset-override")
 )
 
-
-def _load_persisted_dataset() -> str:
-    try:
-        return _DATASET_STATE_FILE.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeDecodeError):
-        return ""
+_dataset_overrides: dict[str | None, str] = {}
+_dataset_override_sources: dict[str | None, str] = {}
 
 
-def _persist_dataset(name: str) -> None:
-    """Save (or, for an empty name, clear) the dataset override to disk.
+def _dataset_state_file_for(login: str | None) -> Path:
+    """Per-identity persisted-override file. ``login`` of ``None`` (the
+    shared-token auth mode -- see ``identity.py``) uses the original,
+    un-suffixed filename, so a shared-token deployment's existing
+    persisted choice keeps working unchanged across this change with no
+    migration step. A named login gets its own ``{base}.{login}`` file --
+    nothing pre-existing to migrate for that case, since no such file
+    could have existed before per-identity overrides did."""
+    if login is None:
+        return _DATASET_STATE_FILE
+    return _DATASET_STATE_FILE.with_name(
+        _DATASET_STATE_FILE.name + "." + _safe_filename_component(login)
+    )
 
-    Best-effort: a failure to persist should not stop the switch itself from
-    taking effect for the rest of this session, only from surviving the next
-    restart. Logged, not raised.
-    """
+
+def _persist_dataset(login: str | None, name: str) -> None:
+    """Save (or, for an empty name, clear) one identity's dataset override
+    to disk. Best-effort: a failure to persist should not stop the switch
+    itself from taking effect for the rest of this session, only from
+    surviving the next restart. Logged, not raised."""
+    path = _dataset_state_file_for(login)
     try:
         if name:
-            _DATASET_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            _DATASET_STATE_FILE.write_text(name, encoding="utf-8")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(name, encoding="utf-8")
         else:
-            _DATASET_STATE_FILE.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
     except OSError as exc:
         log.warning(
-            "could not persist dataset override to %s: %s "
+            "could not persist dataset override for %s to %s: %s "
             "(the switch is still in effect for this session, but will not "
             "survive a restart)",
-            _DATASET_STATE_FILE,
+            login or "(shared-token caller)",
+            path,
             exc,
         )
 
 
-def _resolve_initial_dataset() -> tuple[str, str]:
-    """Returns (dataset, source) where source is 'env', 'persisted', or 'none'."""
-    explicit = os.getenv("HOLONBRIDGE_DATASET", "").strip()
-    if explicit:
-        return explicit, "env"
-    persisted = _load_persisted_dataset()
+def _ensure_dataset_override_loaded(login: str | None) -> None:
+    """Lazily resolve and cache one identity's starting override the first
+    time it is asked for. Mirrors what used to be a single eager
+    ``_resolve_initial_dataset()`` call at import time, just done once per
+    identity on first use instead of once globally at import -- the set of
+    identities that will ever connect to a running process isn't known in
+    advance, so there is nothing to eagerly resolve at import for any of
+    them but the env var, which applies to all of them identically anyway.
+    """
+    if login in _dataset_overrides:
+        return
+    if _ENV_DATASET:
+        _dataset_overrides[login] = _ENV_DATASET
+        _dataset_override_sources[login] = "env"
+        return
+    try:
+        persisted = _dataset_state_file_for(login).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        persisted = ""
     if persisted:
         log.info(
-            "restored dataset override %r from %s (surviving a prior "
-            "restart) — set HOLONBRIDGE_DATASET explicitly to override this",
+            "restored dataset override %r for %s from %s (surviving a "
+            "prior restart) -- set HOLONBRIDGE_DATASET explicitly to "
+            "override this for every identity",
             persisted,
-            _DATASET_STATE_FILE,
+            login or "(shared-token caller)",
+            _dataset_state_file_for(login),
         )
-        return persisted, "persisted"
-    return "", "none"
+        _dataset_overrides[login] = persisted
+        _dataset_override_sources[login] = "persisted"
+    else:
+        _dataset_overrides[login] = ""
+        _dataset_override_sources[login] = "none"
 
 
-_dataset_override, _dataset_override_source = _resolve_initial_dataset()
+def current_dataset_override() -> str:
+    """The calling identity's own dataset override, or ``""`` if they have
+    none. "Calling identity" is ``current_github_login.get()`` -- see that
+    ContextVar's docstring in ``identity.py`` for why this is already
+    scoped correctly per MCP session (set once per SSE connection,
+    inherited by every tool call the session makes afterward) without
+    this function needing to track sessions itself. Two different
+    identities calling this at the same moment get two independent
+    answers; the same identity calling it from two different tabs/sessions
+    shares one answer, which is the intended granularity -- a dataset
+    choice is a property of *who you are*, not of which browser tab
+    happens to be open."""
+    login = current_github_login.get()
+    _ensure_dataset_override_loaded(login)
+    return _dataset_overrides[login]
 
-# The same treatment for banks. A *bank* is a named backend connection -- a
-# server URL plus a default dataset -- previously called a "profile". The two
-# overrides are deliberately independent: a bank selects *which store*, a
-# dataset selects *which graph set within it*, and switching one should not
-# silently reset the other.
-#
-# Kept as a parallel implementation rather than folded into one generic
-# helper with the dataset functions above. The duplication is about fifteen
-# lines; the alternative rewrites code that a live restart test and eight
-# unit tests currently cover, to save less than it risks.
+
+def current_dataset_override_source() -> str:
+    """``"env"``, ``"persisted"``, ``"explicit"``, or ``"none"`` -- see
+    ``current_dataset_override``'s docstring for the identity scoping this
+    shares."""
+    login = current_github_login.get()
+    _ensure_dataset_override_loaded(login)
+    return _dataset_override_sources[login]
+
+
+def set_dataset_override(name: str, source: str) -> None:
+    """Set (or, for an empty ``name``, clear) the calling identity's own
+    dataset override, and persist it under that identity's own file.
+    Never touches any other identity's override."""
+    login = current_github_login.get()
+    if name:
+        _dataset_overrides[login] = name
+        _dataset_override_sources[login] = source
+    else:
+        _dataset_overrides[login] = ""
+        _dataset_override_sources[login] = "none"
+    _persist_dataset(login, name)
+
+
+# --------------------------------------------------------------------------
+# Bank override -- same shape as the dataset override above, same reasoning
+# throughout. Kept as a parallel implementation rather than folded into one
+# generic helper with the dataset functions above, same call as before this
+# change: the duplication is modest and the alternative rewrites code that
+# a live restart test and several unit tests already cover, to save less
+# than it risks.
+# --------------------------------------------------------------------------
+
+_ENV_BANK = os.getenv("HOLONBRIDGE_BANK", "").strip()
+
 _BANK_STATE_FILE = Path(
     os.getenv("HOLONBRIDGE_BANK_STATE_FILE", "")
     or (Path.home() / ".holonbridge" / "mcp-bank-override")
 )
 
-
-def _load_persisted_bank() -> str:
-    try:
-        return _BANK_STATE_FILE.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeDecodeError):
-        return ""
+_bank_overrides: dict[str | None, str] = {}
+_bank_override_sources: dict[str | None, str] = {}
 
 
-def _persist_bank(name: str) -> None:
-    """Save (or, for an empty name, clear) the bank override to disk.
+def _bank_state_file_for(login: str | None) -> Path:
+    """See ``_dataset_state_file_for`` -- identical reasoning, including
+    the ``None``-uses-the-unsuffixed-file backward-compatibility case."""
+    if login is None:
+        return _BANK_STATE_FILE
+    return _BANK_STATE_FILE.with_name(
+        _BANK_STATE_FILE.name + "." + _safe_filename_component(login)
+    )
 
-    Best-effort, exactly as for the dataset override: failing to persist must
-    not stop the switch taking effect for this session, only from surviving a
-    restart.
-    """
+
+def _persist_bank(login: str | None, name: str) -> None:
+    """See ``_persist_dataset`` -- identical reasoning."""
+    path = _bank_state_file_for(login)
     try:
         if name:
-            _BANK_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            _BANK_STATE_FILE.write_text(name, encoding="utf-8")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(name, encoding="utf-8")
         else:
-            _BANK_STATE_FILE.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
     except OSError as exc:
         log.warning(
-            "could not persist bank override to %s: %s "
+            "could not persist bank override for %s to %s: %s "
             "(the switch is still in effect for this session, but will not "
             "survive a restart)",
-            _BANK_STATE_FILE,
+            login or "(shared-token caller)",
+            path,
             exc,
         )
 
 
-def _resolve_initial_bank() -> tuple[str, str]:
-    """Returns (bank, source) where source is 'env', 'persisted', or 'none'."""
-    explicit = os.getenv("HOLONBRIDGE_BANK", "").strip()
-    if explicit:
-        return explicit, "env"
-    persisted = _load_persisted_bank()
+def _ensure_bank_override_loaded(login: str | None) -> None:
+    """See ``_ensure_dataset_override_loaded`` -- identical reasoning."""
+    if login in _bank_overrides:
+        return
+    if _ENV_BANK:
+        _bank_overrides[login] = _ENV_BANK
+        _bank_override_sources[login] = "env"
+        return
+    try:
+        persisted = _bank_state_file_for(login).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        persisted = ""
     if persisted:
         log.info(
-            "restored bank override %r from %s (surviving a prior restart) "
-            "— set HOLONBRIDGE_BANK explicitly to override this",
+            "restored bank override %r for %s from %s (surviving a prior "
+            "restart) -- set HOLONBRIDGE_BANK explicitly to override this "
+            "for every identity",
             persisted,
-            _BANK_STATE_FILE,
+            login or "(shared-token caller)",
+            _bank_state_file_for(login),
         )
-        return persisted, "persisted"
-    return "", "none"
+        _bank_overrides[login] = persisted
+        _bank_override_sources[login] = "persisted"
+    else:
+        _bank_overrides[login] = ""
+        _bank_override_sources[login] = "none"
 
 
-_bank_override, _bank_override_source = _resolve_initial_bank()
+def current_bank_override() -> str:
+    """See ``current_dataset_override`` -- identical identity scoping."""
+    login = current_github_login.get()
+    _ensure_bank_override_loaded(login)
+    return _bank_overrides[login]
+
+
+def current_bank_override_source() -> str:
+    """See ``current_dataset_override_source`` -- identical identity scoping."""
+    login = current_github_login.get()
+    _ensure_bank_override_loaded(login)
+    return _bank_override_sources[login]
+
+
+def set_bank_override(name: str, source: str) -> None:
+    """See ``set_dataset_override`` -- identical identity scoping."""
+    login = current_github_login.get()
+    if name:
+        _bank_overrides[login] = name
+        _bank_override_sources[login] = source
+    else:
+        _bank_overrides[login] = ""
+        _bank_override_sources[login] = "none"
+    _persist_bank(login, name)
+
+
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
@@ -233,8 +389,9 @@ def _headers() -> dict[str, str]:
     headers = {"Accept": "application/json"}
     if BEARER:
         headers["Authorization"] = f"Bearer {BEARER}"
-    if _dataset_override:
-        headers["X-Dataset-Override"] = _dataset_override
+    override = current_dataset_override()
+    if override:
+        headers["X-Dataset-Override"] = override
     login = current_github_login.get()
     if login:
         headers["X-Holon-Animus-Id"] = login
@@ -243,17 +400,19 @@ def _headers() -> dict[str, str]:
 
 
 def _with_bank(params: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Apply the bank override as ``?bank=`` without discarding caller params.
+    """Apply the calling identity's bank override as ``?bank=`` without
+    discarding caller params.
 
     The bridge resolves the bank from the query string rather than a header
     (``deps.resolve_conn`` reads ``request.query_params["bank"]``), so this
     has to merge rather than replace -- a caller-supplied ``bank`` still wins,
     which keeps a deliberate per-call choice above the session default.
     """
-    if not _bank_override:
+    override = current_bank_override()
+    if not override:
         return params
     merged = dict(params or {})
-    merged.setdefault("bank", _bank_override)
+    merged.setdefault("bank", override)
     return merged
 
 

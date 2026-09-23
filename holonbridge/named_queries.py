@@ -66,10 +66,23 @@ _QUERY_FIELDS: dict[str, tuple[str, ...]] = {
     "target_graph": ("targetGraph", "defaultGraph", "graph"),
 }
 _PARAM_LINKS = ("parameter", "parameters", "hasParameter", "param")
+# "parameterName"/"parameterDatatype"/"parameterDescription" added
+# 2026-09-22: the holon-named-queries skill documents these as the
+# canonical hquery:Parameter property names, but they were missing from
+# this table entirely. rdfutil.pick() is exact local-name equality, so
+# pick(props, _PARAM_FIELDS["name"]) returned None for any Parameter
+# authored per the skill's own documented shape -- and in the loader's
+# loop below, that isn't just a missing name, `if not name: continue`
+# drops the whole Parameter node. A query loaded with a real SPARQL body
+# and correctly-authored parameter metadata still came back with
+# parameters: [], and run_named_query rejected any caller-supplied
+# parameter as undeclared. Confirmed live 2026-09-22 against Person_age
+# and Player_age-eligibility in the bridgerton dataset. Purely additive:
+# nothing already relying on the shorter aliases changes behaviour.
 _PARAM_FIELDS: dict[str, tuple[str, ...]] = {
-    "name": ("name", "varName", "variable", "paramName"),
-    "datatype": ("datatype", "dataType", "kind", "range"),
-    "description": ("description", "comment"),
+    "name": ("name", "varName", "variable", "paramName", "parameterName"),
+    "datatype": ("datatype", "dataType", "kind", "range", "parameterDatatype"),
+    "description": ("description", "comment", "parameterDescription"),
     "required": ("required", "isRequired"),
     "default": ("default", "defaultValue"),
 }

@@ -18,7 +18,20 @@ loaded query therefore carries its vocabulary, and binding dispatches on it.
 the entire query form, past ORDER BY and LIMIT. Appending therefore needs no
 parsing of the body and cannot corrupt a well-formed query. Unsupplied
 parameters stay unbound, which preserves the "omit for all" behaviour HGA
-queries rely on.
+queries rely on. Note the corollary, confirmed live 2026-09-22 against
+Person_age's asOfDate and Player_age-eligibility's team/minimumAge: a
+parameter used ONLY inside a BIND/FILTER (never a real triple-pattern
+variable) can never actually be affected by this append-after-everything
+join, no matter how the query is phrased -- SPARQL joins the trailing VALUES
+in only after the whole WHERE clause (including every BIND/FILTER in it) has
+already evaluated. Such a parameter is accepted (shows in a run's "bound"
+list) and silently does nothing. There is no hquery:-side fix for this; the
+working alternative is an hb:-vocabulary query, where {{placeholder}}
+substitution happens as text replacement before parsing and so isn't
+subject to the timing issue at all (see Person_age_as_of in the bridgerton
+dataset for a worked example) -- at the cost of losing hquery:'s "omit for
+all" behaviour, since an unresolved {{placeholder}} with no default fails
+the call outright rather than binding nothing.
 
 **Class matching is by local name.** The loader finds anything typed
 ``*NamedQuery`` in the registry graph and derives the vocabulary from that
@@ -27,6 +40,20 @@ Properties are matched by local name too. This tolerates the two schemes
 differing in spelling and survives a third being added. The trade is that a
 different vocabulary also called ``NamedQuery`` would be picked up; see
 :data:`QUERY_CLASS_SUFFIX` to tighten it.
+
+**CHANGED 2026-09-23: author-supplied SHACL parameter shapes.** A query's
+``Parameter`` list no longer has to come from the flat ``hquery:parameter``/
+``hb:parameter`` blank nodes alone. If a ``sh:NodeShape`` exists in the same
+registry graph with ``sh:targetNode`` pointing at the query's own IRI, its
+``sh:property`` list is parsed instead -- wholesale, not merged -- and wins
+over the flat declarations when both exist for the same query. This is the
+extension point ``params.shacl_shape_for_query``'s own comment already
+flagged as intended-but-not-built: richer constraint vocabulary (``sh:in``,
+``sh:pattern``, ``sh:minInclusive``/``sh:maxInclusive``) than the flat
+five-field ``Parameter`` shape can express, using real SHACL rather than a
+bespoke parallel structure. Nothing about the flat-declaration path changed;
+a query with no author-supplied shape loads exactly as it always has. See
+:func:`_parse_author_shape_params`.
 """
 
 from __future__ import annotations
@@ -87,6 +114,23 @@ _PARAM_FIELDS: dict[str, tuple[str, ...]] = {
     "default": ("default", "defaultValue"),
 }
 
+# Field local names for an author-supplied SHACL sh:property node. Separate
+# table from _PARAM_FIELDS above (different vocabulary, real SHACL this
+# time, not the bespoke hb:/hquery: predicates) -- sh:in is handled outside
+# this table entirely, since it's a SHACL list rather than a plain value and
+# needs its own list-traversal query (_author_shape_in_query).
+_SHAPE_PARAM_FIELDS: dict[str, tuple[str, ...]] = {
+    "path": ("path",),
+    "nodeKind": ("nodeKind",),
+    "datatype": ("datatype",),
+    "description": ("description", "comment"),
+    "default": ("defaultValue",),
+    "minCount": ("minCount",),
+    "pattern": ("pattern",),
+    "minInclusive": ("minInclusive",),
+    "maxInclusive": ("maxInclusive",),
+}
+
 
 @dataclass
 class NamedQuery:
@@ -123,6 +167,12 @@ class NamedQuery:
                     "required": p.required,
                     "description": p.description,
                     "default": p.default,
+                    "allowedValues": list(p.allowed_values)
+                    if p.allowed_values
+                    else None,
+                    "pattern": p.pattern,
+                    "minInclusive": p.min_inclusive,
+                    "maxInclusive": p.max_inclusive,
                 }
                 for p in self.params
             ],
@@ -181,6 +231,102 @@ WHERE {{
 }}"""
 
 
+def _author_shapes_query(graph: str) -> str:
+    """Every field of every sh:property node belonging to an author-supplied
+    shape that targets a registered query by IRI (``sh:NodeShape
+    sh:targetNode <query IRI>``). Deliberately the same ``?q ?param ?p ?o``
+    row shape ``_params_query`` produces, so the exact same
+    ``collect()``/owner-map pattern used for the flat declarations below
+    works unchanged here against a different query and a different (real
+    SHACL, not hb:/hquery:) predicate vocabulary.
+    """
+    return f"""PREFIX sh: <http://www.w3.org/ns/shacl#>
+SELECT ?q ?param ?p ?o
+WHERE {{
+  GRAPH <{graph}> {{
+    ?shape a sh:NodeShape ;
+           sh:targetNode ?q ;
+           sh:property ?param .
+    ?param ?p ?o .
+  }}
+}}"""
+
+
+def _author_shape_in_query(graph: str) -> str:
+    """``sh:in``'s value is a SHACL list, not a plain literal/IRI, so it
+    can't fit the flat ``?param ?p ?o`` shape ``_author_shapes_query`` uses
+    for every other field on a ``sh:property`` node -- this walks the list
+    (``rdf:rest*/rdf:first``) separately.
+    """
+    return f"""PREFIX sh: <http://www.w3.org/ns/shacl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?param ?val
+WHERE {{
+  GRAPH <{graph}> {{
+    ?shape a sh:NodeShape ; sh:targetNode ?q ; sh:property ?param .
+    ?param sh:in ?list .
+    ?list rdf:rest*/rdf:first ?val .
+  }}
+}}"""
+
+
+def _parse_author_shape_params(
+    shape_rows: list[dict], in_rows: list[dict]
+) -> dict[str, list[Parameter]]:
+    """Parameters declared via an author-supplied SHACL shape -- preferred
+    over the flat hb:/hquery: declarations for a given query when both
+    exist, per this module's docstring. Uses the exact ``sh:path`` ==
+    ``_PARAM_PATH_NS + name`` convention ``params.shacl_shape_for_query``
+    already generates for the derived (read-only) schema view, so a shape
+    an author hand-extends is speaking the same language the bridge would
+    have derived on its own, not a second, incompatible convention.
+
+    ``sh:nodeKind sh:IRI`` takes precedence over ``sh:datatype`` for a given
+    property, matching how ``params.is_iri_datatype``/
+    ``shacl_shape_for_query`` already treat IRI-vs-literal as mutually
+    exclusive elsewhere in this codebase.
+    """
+    props = collect(shape_rows, "param")
+    owner = {r["param"]["value"]: r["q"]["value"] for r in shape_rows}
+
+    allowed: dict[str, list[str]] = {}
+    for row in in_rows:
+        allowed.setdefault(row["param"]["value"], []).append(row["val"]["value"])
+
+    by_query: dict[str, list[Parameter]] = {}
+    for node, fields in props.items():
+        path = pick(fields, _SHAPE_PARAM_FIELDS["path"])
+        if not path:
+            continue
+        name = local_name(path)
+
+        node_kind = pick(fields, _SHAPE_PARAM_FIELDS["nodeKind"])
+        datatype = (
+            "IRI"
+            if node_kind and local_name(node_kind) == "IRI"
+            else pick(fields, _SHAPE_PARAM_FIELDS["datatype"])
+        )
+        min_count = pick(fields, _SHAPE_PARAM_FIELDS["minCount"])
+        min_inc = pick(fields, _SHAPE_PARAM_FIELDS["minInclusive"])
+        max_inc = pick(fields, _SHAPE_PARAM_FIELDS["maxInclusive"])
+        in_values = allowed.get(node)
+
+        by_query.setdefault(owner[node], []).append(
+            Parameter(
+                name=name,
+                datatype=datatype,
+                description=pick(fields, _SHAPE_PARAM_FIELDS["description"]) or "",
+                required=(min_count or "0") not in {"0", ""},
+                default=pick(fields, _SHAPE_PARAM_FIELDS["default"]),
+                allowed_values=tuple(in_values) if in_values else None,
+                min_inclusive=float(min_inc) if min_inc is not None else None,
+                max_inclusive=float(max_inc) if max_inc is not None else None,
+                pattern=pick(fields, _SHAPE_PARAM_FIELDS["pattern"]),
+            )
+        )
+    return by_query
+
+
 async def load_named_queries(
     client: FusekiClient, conn: Conn, *, graph: str | None = None
 ) -> LoadResult:
@@ -234,6 +380,23 @@ async def load_named_queries(
         log.warning(message)
         warnings.append(message)
 
+    author_params_by_query: dict[str, list[Parameter]] = {}
+    try:
+        shape_rows = (await client.select(conn, _author_shapes_query(registry)))[
+            "results"
+        ]["bindings"]
+        in_rows = (await client.select(conn, _author_shape_in_query(registry)))[
+            "results"
+        ]["bindings"]
+        author_params_by_query = _parse_author_shape_params(shape_rows, in_rows)
+    except (FusekiError, KeyError) as exc:
+        message = (
+            f"author-shape parameter load failed: {exc}; "
+            "falling back to flat declarations where present"
+        )
+        log.warning(message)
+        warnings.append(message)
+
     queries: list[NamedQuery] = []
     seen: dict[str, NamedQuery] = {}
 
@@ -250,6 +413,13 @@ async def load_named_queries(
         query_id = pick(props, _QUERY_FIELDS["id"]) or local_name(iri)
 
         declared_type = (pick(props, _QUERY_FIELDS["query_type"]) or "").upper()
+        # An author-supplied shape wins wholesale over the flat declarations
+        # for this query when one exists -- not merged, per this module's
+        # docstring, so there's exactly one place to look to know what a
+        # given query actually accepts.
+        resolved_params = author_params_by_query.get(iri) or params_by_query.get(
+            iri, []
+        )
         query = NamedQuery(
             id=query_id,
             iri=iri,
@@ -259,7 +429,7 @@ async def load_named_queries(
             description=pick(props, _QUERY_FIELDS["description"]) or "",
             query_type=declared_type or form(sparql),
             target_graph=pick(props, _QUERY_FIELDS["target_graph"]),
-            params=sorted(params_by_query.get(iri, []), key=lambda p: p.name),
+            params=sorted(resolved_params, key=lambda p: p.name),
         )
 
         if query_id in seen:
@@ -339,7 +509,7 @@ def _bind_values(query: NamedQuery, supplied: Mapping[str, Any]) -> BoundQuery:
             value = param.default
         else:
             continue  # unsupplied stays unbound: "omit for all"
-        pairs.append((name, render_term(value, param.datatype)))
+        pairs.append((name, render_term(value, param.datatype, param=param)))
 
     clause = values_clause(pairs)
     sparql = query.sparql

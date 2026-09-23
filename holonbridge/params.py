@@ -7,6 +7,17 @@ escaped SPARQL term or raises. Nothing is ever pasted in raw.
 Datatypes come from the registry's parameter declarations, never from the
 Python type of the supplied value — so a query's behaviour does not depend
 on how a caller happened to type an argument.
+
+CHANGED 2026-09-23: :class:`Parameter` grew four optional fields --
+``allowed_values``, ``min_inclusive``, ``max_inclusive``, ``pattern`` --
+sourced from an author-supplied SHACL shape (``sh:in``, ``sh:minInclusive``,
+``sh:maxInclusive``, ``sh:pattern``) rather than the flat hb:/hquery:
+declarations, which have no room for them. See
+``named_queries._parse_author_shape_params`` for where these get populated,
+and :func:`shacl_shape_for_query`'s module comment below for why this
+extension point exists. :func:`render_term` checks them when a ``param`` is
+passed, additively -- after, never instead of, the existing datatype/lexical
+checks every parameter has always gone through.
 """
 
 from __future__ import annotations
@@ -35,18 +46,31 @@ _LITERAL_ESCAPES = {
 
 
 class ParameterError(ValueError):
-    """A supplied parameter cannot be rendered as the declared datatype."""
+    """A supplied parameter cannot be rendered as the declared datatype, or
+    fails a constraint declared on it (see the module docstring)."""
 
 
 @dataclass(frozen=True)
 class Parameter:
-    """A parameter declaration as it appears in the registry."""
+    """A parameter declaration as it appears in the registry.
+
+    ``allowed_values``/``min_inclusive``/``max_inclusive``/``pattern`` are
+    only ever populated from an author-supplied SHACL shape today (the flat
+    hb:/hquery: declaration style has no predicates for them) -- they are
+    ``None`` for every parameter loaded the original way, which is exactly
+    the "additive, opt-in" behaviour intended: nothing currently registered
+    changes until someone writes a shape for it.
+    """
 
     name: str
     datatype: str | None = None
     description: str = ""
     required: bool = False
     default: str | None = None
+    allowed_values: tuple[str, ...] | None = None
+    min_inclusive: float | None = None
+    max_inclusive: float | None = None
+    pattern: str | None = None
 
 
 # --- term rendering -----------------------------------------------------------
@@ -80,12 +104,25 @@ def escape_literal(value: str) -> str:
     return "".join(_LITERAL_ESCAPES.get(ch, ch) for ch in value)
 
 
-def render_term(value: Any, datatype: str | None = None) -> str:
+def render_term(
+    value: Any, datatype: str | None = None, *, param: "Parameter | None" = None
+) -> str:
     """Render one value as a complete SPARQL term.
 
     Raises :class:`ParameterError` rather than emitting anything it cannot
-    vouch for.
+    vouch for. When ``param`` is supplied, additionally enforces whatever
+    constraints it declares beyond lexical-form correctness -- see
+    :func:`_check_declared_constraints`. Every existing call site that
+    doesn't pass ``param`` behaves exactly as before; this is purely
+    additive for call sites that opt in.
     """
+    term = _render_term_core(value, datatype)
+    if param is not None:
+        _check_declared_constraints(value, param)
+    return term
+
+
+def _render_term_core(value: Any, datatype: str | None = None) -> str:
     if value is None:
         raise ParameterError("cannot render a null parameter value")
 
@@ -157,6 +194,68 @@ def _check_lexical_form(text: str, datatype: str) -> None:
             raise ParameterError(f"{text!r} is not a valid xsd:date")
 
 
+def _check_declared_constraints(value: Any, param: "Parameter") -> None:
+    """Constraints beyond lexical-form correctness: sh:in, sh:pattern,
+    sh:minInclusive/sh:maxInclusive from an author-supplied SHACL shape
+    (see named_queries._parse_author_shape_params). None of these exist on
+    the flat, always-derived Parameter shape a query gets without one, so
+    this is a no-op for every parameter loaded that way -- checked first,
+    before doing any string work, since that is overwhelmingly the common
+    case today.
+
+    Runs after :func:`_render_term_core` has already vouched for ``value``
+    as a well-formed term of the declared datatype; a constraint here is
+    additive; it never substitutes for that check.
+    """
+    if (
+        param.allowed_values is None
+        and param.pattern is None
+        and param.min_inclusive is None
+        and param.max_inclusive is None
+    ):
+        return
+
+    # Matches _render_term_core's own bool rendering (lowercase "true"/
+    # "false"), not Python's str(True) -- an sh:in listing "true"/"false"
+    # should mean the same thing render_term would actually emit.
+    if value is True:
+        text = "true"
+    elif value is False:
+        text = "false"
+    else:
+        text = str(value)
+
+    if param.allowed_values is not None and text not in param.allowed_values:
+        raise ParameterError(
+            f"{param.name}: {text!r} is not one of the declared allowed values "
+            f"{list(param.allowed_values)}"
+        )
+
+    if param.pattern is not None and not re.search(param.pattern, text):
+        raise ParameterError(
+            f"{param.name}: {text!r} does not match the declared pattern {param.pattern!r}"
+        )
+
+    if param.min_inclusive is not None or param.max_inclusive is not None:
+        try:
+            numeric = float(text)
+        except ValueError as exc:
+            raise ParameterError(
+                f"{param.name}: {text!r} is not numeric, but declares a "
+                "minInclusive/maxInclusive bound"
+            ) from exc
+        if param.min_inclusive is not None and numeric < param.min_inclusive:
+            raise ParameterError(
+                f"{param.name}: {numeric} is below the declared minimum "
+                f"{param.min_inclusive}"
+            )
+        if param.max_inclusive is not None and numeric > param.max_inclusive:
+            raise ParameterError(
+                f"{param.name}: {numeric} is above the declared maximum "
+                f"{param.max_inclusive}"
+            )
+
+
 # --- hb: placeholder substitution ---------------------------------------------
 
 
@@ -185,8 +284,9 @@ def substitute_params(
 
     def replace(match: re.Match[str]) -> str:
         name = match.group(1)
+        param = declared.get(name)
         if name not in supplied or supplied[name] is None:
-            default = declared.get(name).default if name in declared else None
+            default = param.default if param else None
             if default is None:
                 missing.append(name)
                 return match.group(0)
@@ -194,8 +294,8 @@ def substitute_params(
         else:
             value = supplied[name]
 
-        datatype = declared[name].datatype if name in declared else None
-        term = render_term(value, datatype)
+        datatype = param.datatype if param else None
+        term = render_term(value, datatype, param=param)
         substituted.append(name)
         return term
 
@@ -254,6 +354,16 @@ def values_clause(bindings: Iterable[tuple[str, str]]) -> str:
 # the intended extension point is an author-supplied shapes block living
 # alongside the query in the registry, preferred over the derived one when
 # present -- not yet built; this module only does the derived half.
+#
+# CHANGED 2026-09-23: that extension point now exists --
+# named_queries._parse_author_shape_params reads a hand-authored sh:NodeShape
+# (sh:targetNode <query IRI>) using this exact sh:path convention, so an
+# author extends what would otherwise be derived rather than inventing a
+# second one. This function's own output below now also emits sh:in/
+# sh:pattern/sh:minInclusive/sh:maxInclusive when a Parameter carries them
+# (from either loading path), so GET .../schema stays accurate either way --
+# still a pure, always-fresh view of whatever the query's real Parameter
+# list is, never stored, never a second source of truth.
 
 #: Namespace for the synthetic per-parameter sh:path used below. These are
 #: not real predicates asserted on any data; they only need to be stable
@@ -270,9 +380,20 @@ def shacl_shape_for_query(query_id: str, query_iri: str, params: list[Parameter]
     sh:IRI`` for an IRI-typed parameter (same test as ``is_iri_datatype``
     everywhere else), ``sh:datatype`` for a literal-typed one, ``sh:minCount
     1`` when ``required`` is set, and ``sh:defaultValue``/``sh:description``
-    when the registry declared them. Parameters are ordered by name for a
-    stable, diffable output; ``sh:order`` on each property preserves that
-    ordering for a client that wants to render a form in a fixed sequence.
+    when the registry declared them, plus ``sh:in``/``sh:pattern``/
+    ``sh:minInclusive``/``sh:maxInclusive`` when present. Parameters are
+    ordered by name for a stable, diffable output; ``sh:order`` on each
+    property preserves that ordering for a client that wants to render a
+    form in a fixed sequence.
+
+    ``sh:in`` members are rendered here as plain string literals regardless
+    of whether the parameter is IRI-typed -- adequate for a documentation/
+    form-hint view (the only consumer today), but not a claim that the
+    round-trip through :func:`named_queries._parse_author_shape_params`
+    would reconstruct an IRI-typed enumeration byte-for-byte; an author
+    writing a shape by hand for an IRI-typed sh:in should use real ``<IRI>``
+    terms in it, which that loader reads correctly regardless of what this
+    derived view chooses to print.
     """
     shape_iri = f"{query_iri}#ParameterShape"
     header = (
@@ -302,6 +423,17 @@ def shacl_shape_for_query(query_id: str, query_iri: str, params: list[Parameter]
         fields.append("sh:maxCount 1")
         if param.default is not None:
             fields.append(f'sh:defaultValue "{escape_literal(param.default)}"')
+        if param.allowed_values:
+            values_list = " ".join(
+                f'"{escape_literal(v)}"' for v in param.allowed_values
+            )
+            fields.append(f"sh:in ( {values_list} )")
+        if param.pattern:
+            fields.append(f'sh:pattern "{escape_literal(param.pattern)}"')
+        if param.min_inclusive is not None:
+            fields.append(f"sh:minInclusive {param.min_inclusive!r}")
+        if param.max_inclusive is not None:
+            fields.append(f"sh:maxInclusive {param.max_inclusive!r}")
         if param.description:
             fields.append(f'sh:description "{escape_literal(param.description)}"')
         fields.append(f"sh:order {order}")

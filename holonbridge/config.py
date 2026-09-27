@@ -115,6 +115,16 @@ class Settings:
     scheduler_max_firing_depth: int = 3
     config_path: Path = field(default=DEFAULT_CONFIG_PATH)
 
+    # Filesystem path to Fuseki's own assembler-config directory (its
+    # ``run/configuration/`` or equivalent), *only* meaningful when this
+    # bridge process and the Fuseki server it talks to share a filesystem --
+    # true for a local dev/single-box setup like Kurt's, not assumed in
+    # general. None by default: provisioning.py's admin routes refuse to
+    # run rather than guess a path when this isn't set. Deliberately not
+    # derived from fuseki_url, since a reachable HTTP URL says nothing about
+    # whether this process can see that host's disk.
+    fuseki_config_dir: Path | None = None
+
     @classmethod
     def from_env(cls) -> "Settings":
         def _flag(key: str, default: bool) -> bool:
@@ -122,6 +132,8 @@ class Settings:
             if raw is None:
                 return default
             return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+        fuseki_config_dir_raw = os.getenv("FUSEKI_CONFIG_DIR")
 
         return cls(
             host=os.getenv("HOLONBRIDGE_HOST", "127.0.0.1"),
@@ -140,6 +152,7 @@ class Settings:
             scheduler_tick_seconds=float(os.getenv("SCHEDULER_TICK_SECONDS", "30")),
             scheduler_max_firing_depth=int(os.getenv("SCHEDULER_MAX_FIRING_DEPTH", "3")),
             config_path=Path(os.getenv("HOLONBRIDGE_CONFIG", str(DEFAULT_CONFIG_PATH))),
+            fuseki_config_dir=Path(fuseki_config_dir_raw) if fuseki_config_dir_raw else None,
         )
 
 

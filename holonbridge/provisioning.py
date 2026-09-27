@@ -26,6 +26,22 @@ but it is still a filesystem write on the machine Fuseki runs on, so it is
 gated the same way (admin animus only, see routes/dataset_admin.py) for the
 same underlying reason: one shared bearer token cannot yet answer "who
 asked for this."
+
+CHANGED 2026-09-27: fixed a real bug found the hard way in production --
+the entityMap's ``text:map ( ... )`` collection items were being joined
+with commas. A comma is valid between objects in a predicate-object list;
+it is NOT valid between items of a Turtle collection, which are
+whitespace-separated only. Every write this function made before this fix
+produced syntactically invalid Turtle, and because Fuseki's own
+``readConfigurationDirectory`` aborts the *entire* server on one bad
+assembler file rather than skipping it, this took down every dataset on
+the instance, not just the one being provisioned -- confirmed live against
+kurtcagle's chloe.ttl. Two changes as a result: (1) the join separator is
+now whitespace, not a comma; (2) the generated content is now parsed with
+:func:`holonbridge.turtle.parse` before ``ensure_text_index`` will write it
+or ``preview_text_index`` will return it as a success -- a syntax error is
+now a raised :class:`ProvisioningError` naming the parse failure, not a
+file quietly written and discovered broken at the next Fuseki restart.
 """
 
 from __future__ import annotations
@@ -33,6 +49,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from .turtle import TurtleSyntaxError
+from .turtle import parse as parse_turtle
 
 # Default free-text fields for a newly-provisioned Lucene index. Deliberately
 # limited to vocabulary that means "human-readable label or description" in
@@ -64,7 +83,8 @@ _KNOWN_PREFIXES = {
 
 
 class ProvisioningError(ValueError):
-    """Assembler file missing, or not in a shape this tool will patch."""
+    """Assembler file missing, not in a shape this tool will patch, or the
+    patch this function would produce does not parse as valid Turtle."""
 
 
 @dataclass
@@ -156,8 +176,12 @@ def _plan_text_index(
         else:
             patched = prefix_lines + "\n\n" + patched
 
-    # 3. Build the entityMap field list and append the new blocks.
-    field_lines = ",\n".join(
+    # 3. Build the entityMap field list and append the new blocks. Collection
+    #    items in Turtle ``( ... )`` are whitespace-separated -- NOT joined
+    #    with commas, which is a predicate-object-list separator and invalid
+    #    here. (Confirmed with a parser after the earlier comma bug shipped;
+    #    see module docstring.)
+    field_lines = "\n".join(
         f'            [ text:field "{field}" ; text:predicate {prefix}:{local} ]'
         for field, prefix, local in predicates
     )
@@ -182,6 +206,20 @@ def _plan_text_index(
         ) .
 """
     patched = patched.rstrip() + "\n" + block
+
+    # 4. Never hand back (or write) content that doesn't actually parse.
+    # This is the safety net the earlier comma bug should have been caught
+    # by -- a syntax error here becomes a raised ProvisioningError, not a
+    # file that looks fine until Fuseki's own restart discovers otherwise.
+    try:
+        parse_turtle(patched)
+    except TurtleSyntaxError as exc:
+        raise ProvisioningError(
+            f"the patch this would produce for {dataset!r} does not parse as "
+            f"valid Turtle ({exc}) -- refusing to write or preview it. This "
+            "is a bug in provisioning.py itself, not in your existing file; "
+            "please report it rather than working around it."
+        ) from exc
 
     return ProvisionResult(
         dataset=dataset,
@@ -231,9 +269,11 @@ def ensure_text_index(
     add (rdfs/skos/sh/dcterms/text) -- an unknown prefix raises rather than
     silently emitting a Turtle file that won't parse.
 
-    Writes the file. Does not restart Fuseki -- ``ProvisionResult.
-    restart_required`` is always ``True`` on a real change, as a reminder
-    that the caller still owns that step.
+    Writes the file only after confirming the result actually parses as
+    Turtle -- see the module docstring for why that check exists. Does not
+    restart Fuseki -- ``ProvisionResult.restart_required`` is always
+    ``True`` on a real change, as a reminder that the caller still owns
+    that step.
     """
     result = _plan_text_index(
         dataset, config_dir, extra_predicates=extra_predicates, lucene_dir=lucene_dir

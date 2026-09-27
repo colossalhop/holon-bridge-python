@@ -7,18 +7,31 @@ disagreeing is the normal case worth being able to see -- a bank naming
 a dataset that was renamed or never created looks identical to a working
 one until something reads from it and comes back empty.
 
-Listing only. Creating and dropping datasets stays out for now: those are
-destructive server-level operations, and the bridge deliberately holds one
-credential shared by every caller, so "who asked for this" cannot be
-answered yet. Adding them before per-caller identity reaches the REST layer
-would put a `DROP` behind a shared secret.
+Listing only, for Fuseki's own datasets. Creating and dropping datasets
+stays out for now: those are destructive server-level operations, and the
+bridge deliberately holds one credential shared by every caller, so "who
+asked for this" cannot be answered yet. Adding them before per-caller
+identity reaches the REST layer would put a `DROP` behind a shared secret.
+
+CHANGED 2026-09-27: added the text-index provisioning route. This is a
+narrower, additive operation than create/drop -- it patches an *existing*
+dataset's Fuseki assembler file to add a jena-text Lucene index, never
+creating or dropping anything -- but it is still a filesystem write on the
+Fuseki host, so it gets the same admin-only gate for the same reason: no
+per-caller accountability yet for actions this sensitive. See
+provisioning.py for the actual patch logic; this route is a thin
+admin-check-then-call wrapper around it.
 """
 
 from __future__ import annotations
 
+from pydantic import BaseModel
+
 from fastapi import APIRouter, HTTPException, status
 
-from ..deps import ClientDep, ConnDep
+from .. import provisioning
+from ..acl import is_admin
+from ..deps import AnimusDep, ClientDep, ConnDep, SettingsDep
 from ..fuseki import FusekiError
 
 router = APIRouter(tags=["datasets"])
@@ -83,4 +96,84 @@ async def get_dataset(name: str, conn: ConnDep, client: ClientDep) -> dict:
     return {
         **match,
         "graphs": {role: scoped.graph(role) for role in GRAPH_ROLES},
+    }
+
+
+class ExtraPredicate(BaseModel):
+    """One additional text-index field, beyond provisioning.py's defaults."""
+
+    field: str
+    prefix: str
+    local: str
+
+
+class TextIndexRequest(BaseModel):
+    extra_predicates: list[ExtraPredicate] | None = None
+    lucene_dir: str | None = None
+    commit: bool = False
+
+
+@router.post("/datasets/{name}/text-index")
+async def provision_text_index(
+    name: str,
+    body: TextIndexRequest,
+    animus: AnimusDep,
+    client: ClientDep,
+    conn: ConnDep,
+    settings: SettingsDep,
+) -> dict:
+    """Preview or apply a Lucene (`jena-text`) index patch to a dataset's
+    Fuseki assembler file.
+
+    Admin-only, same reasoning as dataset creation/drop in this module's
+    docstring: this is a filesystem write on the Fuseki host, not yet
+    something the shared bearer token can answer "who asked for this" for.
+
+    `commit=false` (the default) returns the full proposed file content as
+    `preview` without writing anything -- look it over, then call again
+    with `commit=true` to actually write it. Idempotent either way: if the
+    dataset's assembler file already declares a text index, this reports
+    `changed=false` rather than layering a second one on top.
+
+    Fuseki must be restarted for a written change to take effect -- this
+    endpoint never restarts it, and never will; see provisioning.py's
+    module docstring for why that stays a separate, human-owned step.
+    """
+
+    async def query_fn(query: str) -> dict:
+        return await client.select(conn, query)
+
+    if not await is_admin(query_fn, conn.holons_graph, person=animus.person):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="admin role required")
+
+    if not settings.fuseki_config_dir:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "FUSEKI_CONFIG_DIR is not configured on this bridge process -- "
+                "set it to Fuseki's assembler-config directory before using "
+                "this endpoint"
+            ),
+        )
+
+    extras = [(p.field, p.prefix, p.local) for p in (body.extra_predicates or [])]
+    fn = provisioning.ensure_text_index if body.commit else provisioning.preview_text_index
+    try:
+        result = fn(
+            name,
+            settings.fuseki_config_dir,
+            extra_predicates=extras,
+            lucene_dir=body.lucene_dir,
+        )
+    except provisioning.ProvisioningError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    return {
+        "dataset": result.dataset,
+        "path": str(result.path),
+        "changed": result.changed,
+        "committed": bool(body.commit and result.changed),
+        "reason": result.reason,
+        "restartRequired": result.restart_required,
+        "preview": None if body.commit else result.new_text,
     }

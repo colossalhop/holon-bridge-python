@@ -100,7 +100,35 @@ class Scheduler:
     async def start(self) -> None:
         if self._loop is not None:
             return
-        await self.reload()
+        try:
+            await self.reload()
+        except Exception as exc:  # noqa: BLE001 - startup must not die on a Fuseki hiccup
+            # HB_SCHEDULER_STARTUP_HARD_DEPENDENCY. Confirmed 2026-07-29,
+            # hit for real 2026-09-27 during a Fuseki/bridge restart race.
+            #
+            # Mirrors the precedent already set by load_named_rules and
+            # load_named_queries: an unreachable registry degrades to an
+            # empty result plus a loud warning, not a raised exception.
+            # start() runs inside the FastAPI lifespan context manager
+            # (see server.py), so before this, any exception here didn't
+            # just leave the scheduler un-started — it aborted the entire
+            # application's startup, taking down every route the bridge
+            # serves (including /health) over what was often nothing more
+            # than Fuseki being a few seconds slower to come up than this
+            # process. Explicitly reset both collections rather than trust
+            # whatever reload() left them at: self._store.tasks() failing
+            # leaves self._tasks alone, but if it succeeds and
+            # self._store.personas() is what fails, self._tasks would
+            # otherwise sit at its new value while self._personas stays
+            # stale -- an inconsistent half-reload, not a clean one.
+            log.warning(
+                "scheduler could not load tasks at startup (%s) -- starting "
+                "with an empty task list; call /scheduler/reload once Fuseki "
+                "is reachable to pick them up",
+                exc,
+            )
+            self._tasks = []
+            self._personas = {}
         self._started_at = stamp()
         self._loop = asyncio.create_task(self._run())
         log.info(

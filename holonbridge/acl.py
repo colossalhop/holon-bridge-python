@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
+from . import delegation
+
 # A query function: given a SPARQL SELECT/ASK string, return SPARQL-JSON
 # bindings (the same shape python's own FusekiClient.select already returns).
 # Sync or async both work -- callers await if it's a coroutine.
@@ -303,6 +305,14 @@ async def is_admin(query_fn: QueryFn, holons_graph: str, *, person: str) -> bool
 # real grant, still fail-closed absent one -- see _scratch_area's own
 # comment for why a per-graph grant is structurally impossible for
 # something minted fresh at write time.
+#
+# CHANGED 2026-09-29: a second, equally explicit path now exists for reads
+# and additive writes -- a stored, time-boxed, revocable holon:Delegation
+# naming the exact graph (see delegation.py). It is consulted only by
+# check_write (permission "write") and authorize_query (permission "read").
+# It is deliberately NOT consulted by check_replace, check_read, or
+# check_invoke: no delegation reaches wholesale replace, and a delegation
+# names graphs, never a Persona-wide ReadGrant or an invocable.
 
 async def _denied_by_override(
     query_fn: QueryFn, holons_graph: str, *, target: str, person: str
@@ -378,7 +388,13 @@ async def check_write(
     ``_scratch_area`` for why a scratch graph, minted fresh at write time,
     could never have a grant naming it specifically. This governs
     additive/merge writes only -- see check_replace for wholesale graph
-    overwrite, which is deliberately a stricter, independent grant."""
+    overwrite, which is deliberately a stricter, independent grant.
+
+    CHANGED 2026-09-29: an active, unrevoked holon:Delegation with the
+    "write" permission that lists ``target`` among its covered graphs also
+    allows the write (see ``delegation.find_delegation``). Not applicable
+    to a scratch target: a delegation covers a delegator's own
+    persona-user graphs, never the scratch namespace."""
     if await is_admin(query_fn, holons_graph, person=person):
         return AclDecision(True, "admin role bypass", person)
     grant_target = (
@@ -398,6 +414,17 @@ async def check_write(
             else "explicit grantsWrite"
         )
         return AclDecision(True, reason, person, grant_target)
+    if grant_target == target:
+        delegated = await delegation.find_delegation(
+            query_fn, holons_graph, delegate=person, permission="write", target=target
+        )
+        if delegated:
+            return AclDecision(
+                True,
+                f"delegated write from {delegated[0].delegator}",
+                person,
+                delegated[0].delegation,
+            )
     if grant_target != target:
         return AclDecision(
             False, "writes are never role-based; no grantsWrite on the scratch area", person
@@ -428,7 +455,12 @@ async def check_replace(
     intended starting state (appends available by default, replace
     available to no one until someone deliberately decides otherwise), not
     an oversight to backfill. Same admin bypass, same fail-closed default
-    as check_write."""
+    as check_write.
+
+    CHANGED 2026-09-29: a holon:Delegation is deliberately NOT consulted
+    here, and cannot be made to be -- delegation.PERMISSIONS has no
+    "replace". Holding a write delegation, like holding grantsWrite,
+    confers nothing on this path."""
     if await is_admin(query_fn, holons_graph, person=person):
         return AclDecision(True, "admin role bypass", person)
     grant_target = (
@@ -616,6 +648,12 @@ async def authorize_query(
     for instance, which this function treats as always readable, matching
     the DataBook's statement that ground truth isn't role-gated). Fail
     closed on anything this function can't positively clear.
+
+    CHANGED 2026-09-29: a graph the caller lacks a Persona ReadGrant for is
+    still cleared if an active holon:Delegation with the "read" permission
+    names that exact graph (``delegation.find_delegation``). Every
+    referenced graph must be cleared one way or the other; a single
+    uncovered graph still denies the whole query.
     """
     if person is None:
         return AclDecision(False, "unresolved identity")
@@ -630,6 +668,14 @@ async def authorize_query(
             continue  # org ground truth or a graph outside the persona scheme
         decision = await check_read(query_fn, holons_graph, person=person, persona=persona)
         if not decision.allowed:
+            if await delegation.find_delegation(
+                query_fn,
+                holons_graph,
+                delegate=person,
+                permission="read",
+                target=graph_iri,
+            ):
+                continue
             return AclDecision(
                 False, f"no ReadGrant covering {graph_iri} (persona {persona})", person
             )

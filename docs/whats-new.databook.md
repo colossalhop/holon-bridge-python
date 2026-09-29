@@ -2,9 +2,9 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.0
+version: 1.0.1
 created: 2026-09-27
-updated: 2026-09-27
+updated: 2026-09-29
 author:
   - name: Kurt Cagle
     iri: https://holongraph.com/people/kurt-cagle
@@ -45,6 +45,34 @@ process:
    not needed yet.
 
 ## Log
+
+### 2026-09-29
+
+- **Delegation: a Person can share their own persona graphs with another
+  Person, revocably, without impersonation.** New `holonbridge/delegation.py`,
+  `holonbridge/routes/delegation.py` (`POST /delegation`,
+  `POST /delegation/revoke`, `GET /delegation`), `shapes/delegation.ttl`, and
+  the `create_delegation` / `revoke_delegation` / `list_delegations` MCP
+  tools. A `holon:Delegation` is a stored, time-boxed record naming the
+  delegator, delegate, persona, the exact graphs covered and the
+  permissions (`read`, `write`); `acl.check_write` and
+  `acl.authorize_query` honour an active one, so every existing write and
+  raw-SPARQL path picks it up with no call-site changes. Never confers
+  replace, admin or a Role; only ever covers the delegator's own
+  persona-user graphs; bounded lifetime (default 7 days, max 90); a
+  deactivated delegator's delegations stop working immediately.
+  [PR #27](https://github.com/kurtcagle/holon-bridge-python/pull/27)
+- **`GET /holon` and the `get_holon` MCP tool gain `on_behalf_of`.** Reads
+  the delegator's scope, limited to exactly the graphs the delegation names
+  -- the one deliberate, guarded exception to "a caller can only ever get
+  their own scope". Refused with a 403 when no active read delegation
+  exists, never silently falling back to the caller's own scope.
+  [PR #27](https://github.com/kurtcagle/holon-bridge-python/pull/27)
+- **Request-supplied IRIs are now validated before they reach generated
+  Turtle or SPARQL** in the delegation code (`delegation.safe_iri`), with
+  control characters escaped in literals. Written with regression tests
+  that fail if the defence is removed.
+  [PR #27](https://github.com/kurtcagle/holon-bridge-python/pull/27)
 
 ### 2026-09-27
 
@@ -109,4 +137,22 @@ hb:release-2026-09-27-d a hb:ReleaseNote ;
     rdfs:label "End-to-end verification of dataset text-search provisioning" ;
     dcterms:description "Confirmed offline backfill (jena.textindexer) against chloe's pre-existing data, live auto-indexing of new writes against a fresh test2 dataset, and documented the per-dataset identity-bootstrap requirement for AnimusDep-gated writes on a brand-new dataset." ;
     rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/blob/main/docs/provisioning-new-dataset-for-search.databook.md> .
+
+hb:release-2026-09-29-a a hb:ReleaseNote ;
+    dcterms:date "2026-09-29"^^xsd:date ;
+    rdfs:label "Delegation: revocable, time-boxed read/write access to a Person's own persona graphs" ;
+    dcterms:description "Added holon:Delegation (holonbridge/delegation.py, routes/delegation.py, shapes/delegation.ttl) and the create_delegation, revoke_delegation and list_delegations MCP tools. acl.check_write and acl.authorize_query honour an active delegation; check_replace never does. Covers only the delegator's own persona-user graphs, never confers replace, admin or a Role, and a deactivated delegator's delegations stop working immediately." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/27> .
+
+hb:release-2026-09-29-b a hb:ReleaseNote ;
+    dcterms:date "2026-09-29"^^xsd:date ;
+    rdfs:label "GET /holon and get_holon gain on_behalf_of" ;
+    dcterms:description "Reads a delegator's scope restricted to exactly the graphs a read delegation names; the one deliberate, guarded exception to callers only ever getting their own scope. Refused with a 403 when no active read delegation exists." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/27> .
+
+hb:release-2026-09-29-c a hb:ReleaseNote ;
+    dcterms:date "2026-09-29"^^xsd:date ;
+    rdfs:label "Request-supplied IRIs validated before reaching generated Turtle or SPARQL" ;
+    dcterms:description "delegation.safe_iri refuses characters that could change a generated statement's structure, and literals now escape control characters. Regression tests fail if either layer is removed." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/27> .
 ```

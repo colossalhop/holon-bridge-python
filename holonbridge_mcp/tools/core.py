@@ -165,17 +165,25 @@ async def create_holon(
 
 
 @mcp.tool()
-async def get_holon(holon_iri: str, projection_mode: str = "immersive") -> str:
+async def get_holon(
+    holon_iri: str,
+    projection_mode: str = "immersive",
+    on_behalf_of: str | None = None,
+) -> str:
     """Retrieve a holon as a DataBook.
 
     Projection modes: immersive, cinematic, active_inference, exploded_view.
+
+    ``on_behalf_of`` reads as another Person's scope (a short slug or full
+    Person IRI). It works only if that Person has an active read delegation
+    to you (see ``create_delegation``); the result is their view, limited to
+    the graphs they delegated, and is refused otherwise. Omit it to read
+    your own scope as usual.
     """
-    return await _call(
-        "GET",
-        "/holon",
-        params={"iri": holon_iri, "projection_mode": projection_mode},
-        text=True,
-    )
+    params: dict = {"iri": holon_iri, "projection_mode": projection_mode}
+    if on_behalf_of:
+        params["on_behalf_of"] = on_behalf_of
+    return await _call("GET", "/holon", params=params, text=True)
 
 
 @mcp.tool()

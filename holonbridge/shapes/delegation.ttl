@@ -1,0 +1,129 @@
+## Reference SHACL shapes for holon:Delegation.
+##
+## A Delegation lets one Person (the delegator) authorise another (the
+## delegate) to read and/or write inside the delegator's OWN persona-user
+## graphs, for a bounded time, revocably, without impersonation.
+## holonbridge/delegation.py is the lookup/creation code; acl.py's
+## check_write and authorize_query consult it.
+##
+## Push into a dataset's own `shacl` graph (conn.shapes_graph), or pass as
+## shapes_graph to push_turtle/ingest, the same way identity.ttl is meant
+## to be deployed. POST /delegation validates the equivalent rules in
+## Python before it writes, so these shapes are the declarative record of
+## the rules and the gate for anything that writes Delegations by another
+## route (a hand-written push, an import).
+##
+## Deliberately NOT sh:closed, matching identity.ttl: a Delegation may
+## accumulate annotations (rdfs:comment, provenance) without a shape edit.
+##
+## Graph-crossing note: none of the sh:sparql constraints below use a
+## GRAPH clause, on purpose. shacl.py rejects graph-crossing
+## SPARQLConstraints (a flat-Graph validation would silently pass them);
+## these are all single-graph and are safe under `/shacl?graph=`.
+##
+## NOT expressible here, enforced in routes/delegation.py instead:
+##   - that the delegator actually holds a Home under the persona
+##   - that a `write` delegation only covers graphs the delegator can
+##     themselves write to (an ACL question, not a graph-shape one)
+##   - that the lifetime is within MAX_LIFETIME (a policy constant)
+
+@prefix holon: <https://w3id.org/holon/> .
+@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh:    <http://www.w3.org/ns/shacl#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+
+holon:Delegation a rdfs:Class ;
+    rdfs:comment "A time-boxed, revocable authorisation for one Person to read and/or write inside another Person's own persona-user graphs. Never confers replace, admin, or any Role."@en .
+
+holon:delegator a rdf:Property ;
+    rdfs:domain holon:Delegation ; rdfs:range holon:Person ;
+    rdfs:comment "The Person whose graphs are being shared."@en .
+
+holon:delegate a rdf:Property ;
+    rdfs:domain holon:Delegation ; rdfs:range holon:Person ;
+    rdfs:comment "The Person receiving access. Keeps their own identity throughout; nothing is impersonated."@en .
+
+holon:delegatedPersona a rdf:Property ;
+    rdfs:domain holon:Delegation ; rdfs:range holon:Persona ;
+    rdfs:comment "The Persona inside whose envelope the delegated graphs sit; also the persona a delegated read resolves scope under."@en .
+
+holon:delegatedGraph a rdf:Property ;
+    rdfs:domain holon:Delegation ;
+    rdfs:comment "One named graph covered. Always one of the delegator's own persona-user graphs; derived by the bridge at creation, never taken from a request."@en .
+
+holon:delegatedPermission a rdf:Property ;
+    rdfs:domain holon:Delegation ;
+    rdfs:comment "'read' or 'write' (additive merge). There is deliberately no 'replace'."@en .
+
+holon:validFrom  a rdf:Property ; rdfs:domain holon:Delegation .
+holon:validUntil a rdf:Property ; rdfs:domain holon:Delegation .
+holon:revokedAt  a rdf:Property ; rdfs:domain holon:Delegation ;
+    rdfs:comment "Stamped once on revocation. The record is retained for audit, not deleted."@en .
+
+holon:DelegationShape a sh:NodeShape ;
+    rdfs:comment "A Delegation between two Persons over the delegator's own persona-user graphs."@en ;
+    sh:targetClass holon:Delegation ;
+    sh:property
+        [ sh:path holon:delegator ; sh:class holon:Person ; sh:nodeKind sh:IRI ;
+          sh:minCount 1 ; sh:maxCount 1 ;
+          sh:disjoint holon:delegate ;
+          sh:message "A person cannot delegate to themselves." ] ,
+        [ sh:path holon:delegate ; sh:class holon:Person ; sh:nodeKind sh:IRI ;
+          sh:minCount 1 ; sh:maxCount 1 ] ,
+        [ sh:path holon:delegatedPersona ; sh:class holon:Persona ; sh:nodeKind sh:IRI ;
+          sh:minCount 1 ; sh:maxCount 1 ] ,
+        [ sh:path holon:delegatedGraph ; sh:nodeKind sh:IRI ; sh:minCount 1 ] ,
+        ## 'replace' is rejected here structurally: it is simply not in the list.
+        [ sh:path holon:delegatedPermission ; sh:datatype xsd:string ;
+          sh:in ( "read" "write" ) ; sh:minCount 1 ; sh:maxCount 2 ] ,
+        [ sh:path holon:validFrom  ; sh:datatype xsd:dateTime ; sh:minCount 1 ; sh:maxCount 1 ] ,
+        [ sh:path holon:validUntil ; sh:datatype xsd:dateTime ; sh:minCount 1 ; sh:maxCount 1 ] ,
+        [ sh:path holon:revokedAt  ; sh:datatype xsd:dateTime ; sh:maxCount 1 ] ;
+
+    ## A delegation must end after it begins.
+    sh:sparql [
+        a sh:SPARQLConstraint ;
+        sh:message "holon:validUntil must be later than holon:validFrom." ;
+        sh:select """
+            SELECT $this WHERE {
+                $this <https://w3id.org/holon/validFrom>  ?from ;
+                      <https://w3id.org/holon/validUntil> ?until .
+                FILTER (?until <= ?from)
+            }
+        """
+    ] ;
+
+    ## Every covered graph must be one of the DELEGATOR's OWN persona-user
+    ## graphs for the DELEGATED persona: urn:...:persona:{persona}:user:{slug}:{role}.
+    ## Person and Persona IRIs end in their local slug, so the expected
+    ## fragment is rebuilt from those two trailing segments. This is what
+    ## stops a delegation from covering someone else's graph, or ground
+    ## truth, or a graph outside the persona scheme.
+    sh:sparql [
+        a sh:SPARQLConstraint ;
+        sh:message "holon:delegatedGraph must be a persona-user graph belonging to the delegator, under the delegated persona." ;
+        sh:select """
+            SELECT $this ?value WHERE {
+                $this <https://w3id.org/holon/delegator>        ?delegator ;
+                      <https://w3id.org/holon/delegatedPersona> ?persona ;
+                      <https://w3id.org/holon/delegatedGraph>   ?value .
+                BIND (REPLACE(STR(?delegator), "^.*:", "") AS ?slug)
+                BIND (REPLACE(STR(?persona),   "^.*:", "") AS ?pname)
+                FILTER (!CONTAINS(STR(?value), CONCAT(":persona:", ?pname, ":user:", ?slug, ":")))
+            }
+        """
+    ] ;
+
+    ## Only the two delegable graph roles: the IRI must END in :holons or :scene.
+    ## `events` (the audit ledger) and everything else are never delegable.
+    sh:sparql [
+        a sh:SPARQLConstraint ;
+        sh:message "holon:delegatedGraph must be a holons or scene graph; other graph roles are not delegable." ;
+        sh:select """
+            SELECT $this ?value WHERE {
+                $this <https://w3id.org/holon/delegatedGraph> ?value .
+                FILTER (!STRENDS(STR(?value), ":holons") && !STRENDS(STR(?value), ":scene"))
+            }
+        """
+    ] .

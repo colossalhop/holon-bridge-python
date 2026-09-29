@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
+from .. import delegation as dg
 from .. import sequence as sequence_mod
 from .. import shacl as shacl_mod
 from ..databook import DataBook
@@ -25,7 +26,7 @@ from ..deps import AnimusDep, BanksDep, ClientDep, ConnDep, PersonasDep, Setting
 from ..fuseki import FusekiError
 from ..holon import PROJECTION_MODES, get_holon
 from ..ingest import write_turtle_to_graph
-from ..persona_scope import resolve_scope_graphs
+from ..persona_scope import SCOPED_ROLES, resolve_scope_graphs
 from ..turtle import TurtleSyntaxError, from_json_ld, parse
 
 router = APIRouter(tags=["holon"])
@@ -51,6 +52,14 @@ async def holon(
         default=None,
         description="Transaction-time bound, paired with observed_at. Defaults to observed_at when only one is given.",
     ),
+    on_behalf_of: str | None = Query(
+        default=None,
+        description=(
+            "Read as this Person's scope (slug or full IRI), which requires an "
+            "active read Delegation from them to you. The persona comes from the "
+            "delegation, and only the graphs it names are readable."
+        ),
+    ),
 ) -> str:
     """Return a holon as a rendered DataBook.
 
@@ -69,6 +78,16 @@ async def holon(
     scope, not name someone else's or one they haven't switched into.
     With no persona switched, scope is exactly ground truth, matching
     this route's behaviour before this change.
+
+    CHANGED 2026-09-29: ``on_behalf_of`` is the one deliberate, guarded
+    exception to the paragraph above. It names another Person, and is
+    honoured only if that Person has an active, unrevoked read Delegation
+    to the caller (see ``holonbridge.delegation``). Even then the scope is
+    that Person's own, restricted to exactly the private graphs the
+    delegation lists -- a delegation covering ``holons`` alone does not
+    expose that Person's ``scene`` graph -- and the caller's own private
+    graphs are not added to it. With no active delegation the answer is a
+    403, never a silent fallback to the caller's own scope.
     """
     if projection_mode not in PROJECTION_MODES:
         raise HTTPException(
@@ -76,7 +95,55 @@ async def holon(
             detail=f"projection_mode must be one of {', '.join(PROJECTION_MODES)}",
         )
     persona, _persona_source = personas.get(person_id=animus.person, dataset=conn.dataset)
-    scope = resolve_scope_graphs(conn, person_id=animus.person, persona=persona)
+
+    delegator: str | None = None
+    if on_behalf_of:
+        try:
+            delegator = (
+                on_behalf_of if ":" in on_behalf_of else conn.person_iri(on_behalf_of)
+            )
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        if delegator == animus.person:
+            delegator = None  # asking to read as yourself is just a normal read
+
+    if delegator is None:
+        scope = resolve_scope_graphs(conn, person_id=animus.person, persona=persona)
+    else:
+
+        async def query_fn(q: str) -> dict:
+            return await client.select(conn, q)
+
+        try:
+            delegated = await dg.resolve_read_delegation(
+                query_fn,
+                conn.holons_graph,
+                delegate=animus.person,
+                delegator=delegator,
+                current_persona=persona,
+                persona_iri_of=conn.persona_graph,
+            )
+        except dg.DelegationRefused as exc:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+        except dg.DelegationAmbiguous as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except dg.DelegationError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except FusekiError as exc:
+            raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
+
+        scope = resolve_scope_graphs(
+            conn, person_id=delegator, persona=delegated.persona
+        )
+        delegator_private = {
+            conn.persona_user_graph(delegated.persona, role, conn.person_slug(delegator))
+            for role in SCOPED_ROLES
+        }
+        # Keep ground truth, the persona's public graphs, and only those of
+        # the delegator's private graphs the delegation actually names.
+        scope = [
+            g for g in scope if g.iri not in delegator_private or g.iri in delegated.graphs
+        ]
     try:
         book = await get_holon(
             client,

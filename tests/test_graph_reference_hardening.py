@@ -42,6 +42,7 @@ ADMIN = "urn:example:person:root"
 JANE = "urn:example:person:jane"
 PERSONA = "urn:example:persona:phoebe"
 PRIVATE = "urn:example:persona:phoebe:user:kurt:holons"
+JANE_PRIVATE = "urn:example:persona:phoebe:user:jane:holons"
 OTHER = "urn:example:persona:phoebe:user:kurt:scene"
 GROUND = "urn:example:scene"
 
@@ -260,10 +261,13 @@ def test_an_admin_still_can(store, conn, text):
 
 
 def test_from_is_checked_like_any_other_reference(store, conn):
-    text = f"SELECT * FROM <{PRIVATE}> WHERE {{ ?s ?p ?o }}"
-    assert not read(store, conn, JANE, text).allowed  # was: "references no graph"
+    mine = f"SELECT * FROM <{JANE_PRIVATE}> WHERE {{ ?s ?p ?o }}"
+    theirs = f"SELECT * FROM <{PRIVATE}> WHERE {{ ?s ?p ?o }}"
+    assert not read(store, conn, JANE, mine).allowed  # was: "references no graph"
+    assert not read(store, conn, JANE, theirs).allowed
     grant(store, read=True)
-    assert read(store, conn, JANE, text).allowed
+    assert read(store, conn, JANE, mine).allowed       # a ReadGrant opens your own private space
+    assert not read(store, conn, JANE, theirs).allowed  # ...but not someone else's
     assert read(store, conn, JANE, f"SELECT * FROM NAMED <{GROUND}> WHERE {{ ?s ?p ?o }}").allowed
 
 

@@ -170,10 +170,18 @@ def test_someone_elses_private_graph_is_refused_and_never_fetched(stub, client):
     assert stub.fetched == []  # refused BEFORE anything was fetched
 
 
-def test_a_persona_readgrant_opens_the_graph(stub, client):
-    grant_read(stub)
+def test_a_persona_readgrant_does_not_open_someone_elses_private_graph(stub, client):
+    grant_read(stub)  # a persona-wide ReadGrant used to open every person's private space
     response = read(client, KURT_HOLONS)
-    assert response.status_code == 200 and "kurt-private-secret" in response.text
+    assert response.status_code == 403 and "kurt-private-secret" not in response.text
+    assert stub.fetched == []
+
+
+def test_a_persona_readgrant_still_opens_your_own_and_the_shared_space(stub, client):
+    grant_read(stub)
+    stub.ds.get_context(URIRef(JANE_HOLONS)).parse(data=PUBLIC.replace("sun", "jane-note"), format="turtle")
+    assert read(client, JANE_HOLONS).status_code == 200
+    assert read(client, "urn:example:persona:phoebe:user:public:holons").status_code == 200
 
 
 def test_an_admin_can_read_it(stub, client, actor):

@@ -765,6 +765,20 @@ def _fallback_graph_refs(sparql_text: str) -> set[str] | None:
     return refs
 
 
+_PRIVATE_SPACE = re.compile(r":persona:[^:]+:user:([^:]+):")
+
+
+def private_space_owner(graph_iri: str) -> str | None:
+    """The slug of the person whose private space ``graph_iri`` is
+    (``urn:...:persona:{persona}:user:{slug}:{role}``), or ``None`` for a graph
+    outside that scheme and for the shared ``public`` user, which belongs to
+    nobody in particular."""
+    match = _PRIVATE_SPACE.search(graph_iri)
+    if match is None or match.group(1) == "public":
+        return None
+    return match.group(1)
+
+
 async def authorize_query(
     query_fn: QueryFn,
     holons_graph: str,
@@ -793,6 +807,15 @@ async def authorize_query(
     to check the ReadGrant against, and clearing it as "references no graph"
     let any identified caller read every graph. FROM/FROM NAMED and USING
     targets are now checked like any other reference. Admins are unaffected.
+
+    CHANGED 2026-09-30: a persona-wide ``ReadGrant`` no longer opens another
+    person's *private* space. The grant is scoped to a persona, so before this
+    it opened every person's private area beneath that persona to any holder
+    -- a coarser rule than "private to you". Another person's private space
+    (see :func:`private_space_owner`) now opens only to an admin or to a
+    holder of an active read delegation naming that graph; a ReadGrant still
+    opens the caller's own private space and the persona's shared ``public``
+    space, as before.
     """
     if person is None:
         return AclDecision(False, "unresolved identity")
@@ -800,6 +823,8 @@ async def authorize_query(
     analysis = analyse_graph_refs(sparql_text)
     if analysis is None:
         return AclDecision(False, "query could not be parsed for graph references; denied, not assumed safe", person)
+
+    caller_slug = person.rsplit(":", 1)[-1]
 
     if analysis.dynamic and not await is_admin(query_fn, holons_graph, person=person):
         return AclDecision(
@@ -819,6 +844,21 @@ async def authorize_query(
         persona = persona_of_graph(graph_iri)
         if persona is None:
             continue  # org ground truth or a graph outside the persona scheme
+        owner = private_space_owner(graph_iri)
+        if owner is not None and owner != caller_slug:
+            if await is_admin(query_fn, holons_graph, person=person):
+                continue
+            if await delegation.find_delegation(
+                query_fn, holons_graph, delegate=person, permission="read", target=graph_iri
+            ):
+                continue
+            return AclDecision(
+                False,
+                f"no ReadGrant covering {graph_iri} (persona {persona}): it is another "
+                "person's private space; only that person, an administrator, or someone "
+                "they have lent it to may read it",
+                person,
+            )
         decision = await check_read(query_fn, holons_graph, person=person, persona=persona)
         if not decision.allowed:
             if await delegation.find_delegation(

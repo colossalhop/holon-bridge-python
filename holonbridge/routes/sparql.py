@@ -20,6 +20,13 @@ read/write asymmetry in the ACL architecture DataBook: a read may be
 covered by a Role's ReadGrant; a write is never covered by a Role at all,
 regardless of what that Role grants for reads, and needs its own explicit
 ``holon:grantsWrite`` on every graph the update touches.
+
+CHANGED 2026-09-30 (audit): each handler also hands the graphs it touched,
+a digest of an update's text (never the text), and the reason for any
+refusal to ``holonbridge.audit.annotate``. A read of *another person's*
+private persona graph -- whether allowed by a delegation, an admin bypass
+or a persona-wide ReadGrant -- is flagged as a security read, so it is
+recorded at the ``standard`` audit level.
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
+from .. import audit
 from ..acl import authorize_query, check_write, extract_graph_refs
 from ..deps import AnimusDep, ClientDep, ConnDep
 from ..fuseki import FusekiError
@@ -75,8 +83,15 @@ async def _authorize_read(text: str, conn: ConnDep, client: ClientDep, animus: A
         sparql_text=text,
         persona_of_graph=conn.persona_for_graph,
     )
+    refs = extract_graph_refs(text) or set()
+    audit.annotate(graphs=sorted(refs))
     if not decision.allowed:
+        audit.annotate(reason=decision.reason)
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail=decision.reason)
+    if animus.person and audit.foreign_user_graphs(refs, conn.person_slug(animus.person)):
+        audit.annotate(
+            security_read=True, reason="read of another person's private persona graph"
+        )
 
 
 async def _authorize_write(text: str, conn: ConnDep, client: ClientDep, animus: AnimusDep) -> None:
@@ -85,10 +100,12 @@ async def _authorize_write(text: str, conn: ConnDep, client: ClientDep, animus: 
 
     refs = extract_graph_refs(text)
     if refs is None:
+        audit.annotate(reason="update could not be parsed for graph references")
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail="update could not be parsed for graph references; denied, not assumed safe",
         )
+    audit.annotate(graphs=sorted(refs))
 
     async def query_fn(q: str) -> dict:
         return await client.select(conn, q)
@@ -98,6 +115,7 @@ async def _authorize_write(text: str, conn: ConnDep, client: ClientDep, animus: 
             query_fn, conn.holons_graph, person=animus.person, target=graph_iri
         )
         if not decision.allowed:
+            audit.annotate(reason=f"{decision.reason} (graph: {graph_iri})")
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
                 detail=f"{decision.reason} (graph: {graph_iri})",
@@ -133,6 +151,8 @@ async def update(
     body: UpdateRequest, conn: ConnDep, client: ClientDep, animus: AnimusDep
 ) -> dict:
     _guard(body.update, expect_update=True)
+    digest, size = audit.payload_digest(body.update)
+    audit.annotate(payload_hash=digest, payload_bytes=size)
     await _authorize_write(body.update, conn, client, animus)
     try:
         await client.update(conn, body.update)

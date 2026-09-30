@@ -41,6 +41,12 @@ grant target for an explicit ``holon:grantsWrite``/``grantsReplace``, the
 is otherwise indistinguishable from the delegator's own in the response.
 This is response-level attribution only; nothing extra is written to the
 graph, so the stored data still does not record who wrote it.
+
+CHANGED 2026-09-30 (audit): the graph, mode, payload digest (never the
+payload) and what authorised the write are now also handed to
+``holonbridge.audit.annotate``, which the audit middleware folds into that
+request's audit entry -- including for a refused write, so a denial says
+which graph and why. ``annotate`` is a no-op outside a request.
 """
 
 from __future__ import annotations
@@ -49,6 +55,7 @@ from typing import Any
 
 from fastapi import HTTPException, status
 
+from . import audit
 from . import shacl as shacl_mod
 from . import write_lock
 from .acl import Animus, check_replace, check_write
@@ -93,6 +100,9 @@ async def write_turtle_to_graph(
     if animus.person is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="unresolved identity")
 
+    digest, size = audit.payload_digest(turtle)
+    audit.annotate(graphs=[graph_iri], write_mode=mode, payload_hash=digest, payload_bytes=size)
+
     async def _query_fn(q: str) -> dict:
         return await client.select(conn, q)
 
@@ -104,6 +114,7 @@ async def write_turtle_to_graph(
         decision = await check_write(
             _query_fn, conn.holons_graph, person=animus.person, target=graph_iri
         )
+    audit.annotate(authorised_by=decision.matched_grant, authorised_reason=decision.reason)
     if not decision.allowed:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,

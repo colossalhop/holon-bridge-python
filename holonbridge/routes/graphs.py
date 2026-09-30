@@ -34,6 +34,17 @@ the identical reason: DROP is unambiguously destructive and wholesale, the
 same shape ``drop_pipeline`` and ``check_replace`` everywhere else in this
 codebase already treat that way). Before this, ``drop_graph`` had zero ACL
 check of any kind.
+
+CHANGED 2026-09-30: ``GET /graph`` now depends on ``AnimusDep`` and applies
+exactly the read rules ``/sparql/select`` applies, via
+``acl.authorize_query`` -- a persona graph needs a ReadGrant, an admin
+bypass or a read delegation; the audit graph is admin-only; ground truth is
+readable by any identified caller. Before this the route had no identity
+check at all, so anyone holding the shared bearer token could read any
+graph's full contents: other people's private persona graphs, delegations,
+grants and the audit log. It is a behaviour change for callers that send
+only the bearer token (they now get a 401 like every other identity-gated
+route). ``GET /graphs`` (names and triple counts only) is unchanged.
 """
 
 from __future__ import annotations
@@ -42,7 +53,9 @@ from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-from ..acl import check_replace
+from .. import audit
+from .. import delegation as dg
+from ..acl import authorize_query, check_replace, extract_graph_refs
 from ..deps import AnimusDep, ClientDep, ConnDep, SettingsDep
 from ..fuseki import FusekiError
 from ..ingest import write_turtle_to_graph
@@ -99,9 +112,53 @@ async def list_graphs(
 
 
 @router.get("/graph", response_class=PlainTextResponse)
-async def get_graph(conn: ConnDep, client: ClientDep, iri: str = Query(...)) -> str:
+async def get_graph(
+    conn: ConnDep, client: ClientDep, animus: AnimusDep, iri: str = Query(...)
+) -> str:
+    """Return one named graph as Turtle, under the same read rules as
+    ``POST /sparql/select`` -- see the module docstring's 2026-09-30 note.
+
+    The check reuses ``acl.authorize_query`` on a probe query for this one
+    graph. ``iri`` comes from the caller and is interpolated into that
+    probe, so it must be a plain IRI (``delegation.safe_iri``) and the probe
+    must parse to *exactly* that single graph reference; anything else is
+    refused rather than checked. Without that, a crafted ``iri`` could make
+    the probe reference a different graph from the one actually fetched.
+    """
     try:
-        return await client.get_graph(conn, iri)
+        safe = dg.safe_iri(iri)
+    except dg.DelegationError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    audit.annotate(graphs=[safe])
+    probe = f"SELECT * WHERE {{ GRAPH <{safe}> {{ ?s ?p ?o }} }}"
+    if extract_graph_refs(probe) != {safe}:
+        audit.annotate(reason="graph IRI could not be read as a single graph reference")
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="graph IRI could not be read as a single graph reference",
+        )
+
+    async def query_fn(q: str) -> dict:
+        return await client.select(conn, q)
+
+    decision = await authorize_query(
+        query_fn,
+        conn.holons_graph,
+        person=animus.person,
+        sparql_text=probe,
+        persona_of_graph=conn.persona_for_graph,
+    )
+    if not decision.allowed:
+        audit.annotate(reason=decision.reason)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=decision.reason)
+    if animus.person and audit.foreign_user_graphs([safe], conn.person_slug(animus.person)):
+        audit.annotate(
+            security_read=True, reason="read of another person's private persona graph"
+        )
+
+    try:
+        return await client.get_graph(conn, safe)
     except FusekiError as exc:
         raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
 

@@ -16,12 +16,14 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 
 from .acting_as import ActingAsStore
+from .audit import AuditMiddleware
 from .config import BankStore, Settings, get_settings
 from .fuseki import FusekiClient
 from .cache import RegistryCache
 from .conn import resolve_conn
 from .persona_state import PersonaStore
 from .routes import (
+    audit as audit_routes,
     banks,
     dataset_admin,
     delegation,
@@ -109,6 +111,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Records mutations, refusals and security reads -- see audit.py.
+    app.add_middleware(AuditMiddleware)
+
     app.include_router(holon_routes.meta_router)
     app.include_router(dataset_admin.router)
     app.include_router(banks.router)
@@ -119,6 +124,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(fluent.router)
     app.include_router(identity_admin.router)
     app.include_router(delegation.router)
+    app.include_router(audit_routes.router)
     app.include_router(named_queries.router)
     app.include_router(named_projections.router)
     app.include_router(named_rules.router)

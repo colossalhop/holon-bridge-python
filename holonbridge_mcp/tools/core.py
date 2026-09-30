@@ -175,10 +175,22 @@ async def get_holon(
     holon_iri: str,
     projection_mode: str = "immersive",
     on_behalf_of: str | None = None,
+    observed_at: str | None = None,
 ) -> str | dict:
     """Retrieve a holon as a DataBook.
 
     Projection modes: immersive, cinematic, active_inference, exploded_view.
+
+    ``observed_at`` (ISO 8601, e.g. ``2026-09-01T12:00:00Z``) reads what the
+    holon's fluents were worth at that moment, from the events ledger, instead
+    of current state. A timestamp with no timezone is read as UTC. Be aware of
+    what this is: a valid-time read over *ground truth only* -- your persona's
+    private graphs are not applied to state, and the DataBook frontmatter's
+    ``scope`` says which graphs were actually read. A holon that has a
+    list-mode fluent is refused, because its history cannot yet be replayed
+    into the set as it stood; omit ``observed_at`` for those. There is no
+    transaction-time (``inserted_at``) parameter: the time an assertion was
+    recorded is not yet consulted, so it would be inert.
 
     ``on_behalf_of`` reads as another Person's scope (a short slug or full
     Person IRI). It works only if that Person has an active read delegation
@@ -195,6 +207,8 @@ async def get_holon(
     params: dict = {"iri": holon_iri, "projection_mode": projection_mode}
     if on_behalf_of:
         params["on_behalf_of"] = on_behalf_of
+    if observed_at:
+        params["observed_at"] = observed_at
     return await _call("GET", "/holon", params=params, text=True)
 
 

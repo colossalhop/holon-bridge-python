@@ -48,35 +48,24 @@ process:
 
 ### 2026-09-30
 
-- **Security fix: a persona-wide `ReadGrant` no longer opens another
-  person's private space.** The grant is scoped to a persona, not a person,
-  so anyone holding one could read every person's private area beneath that
-  persona through `/sparql/select`, `/sparql/construct` and `GET /graph`
-  (`/holon` was never affected). In `acl.authorize_query`, a persona-user
-  graph owned by someone other than the caller now opens only to an admin or
-  to a holder of an active read delegation naming that exact graph; a
-  `ReadGrant` still opens the caller's own private space and the persona's
-  shared `public` space. New `acl.private_space_owner`. The refusal keeps its
-  `no ReadGrant covering ...` prefix and now says who *can* open it.
-  **Behaviour change:** a non-admin who relied on a persona `ReadGrant` to
-  read another person's private space through raw queries now gets a 403;
-  the correct route is a delegation from the owner. Unchanged, deliberately:
-  the owner has no special right to their own space, so the persona
-  `ReadGrant` is still what opens it.
-  [PR #36](https://github.com/kurtcagle/holon-bridge-python/pull/36)
-- **Security fix: `POST /fluent/update` now requires an identity and write
-  access.** It depended only on the connection, so anyone holding the shared
-  bearer token could change a fluent's value and append to the events ledger,
-  with a free-text `asserted_by` recorded as fact, and `fluent`,
-  `asserted_by` and IRI values were interpolated into SPARQL unescaped. A
-  caller now needs an identity and an explicit `grantsWrite` on all three
-  graphs one update writes (events, scene, sequences); `asserted_by` is set
-  from the authenticated person and a different one is refused (an admin uses
-  `act_as`); IRIs are validated with `delegation.safe_iri`.
-  `GET /fluent/{id}/prior` requires an identity and validates its path
-  parameter. The response gains `assertedBy`. **Behaviour change:** non-admin
-  callers without grants on those three graphs now get a 403.
-  [PR #35](https://github.com/kurtcagle/holon-bridge-python/pull/35)
+- **`get_holon` can now read as of a past time, and the as-of read stopped
+  misleading.** The MCP `get_holon` tool gains `observed_at` (ISO 8601), so an
+  LLM client can ask what a holon's fluents were worth at a given moment;
+  until now only the REST route could. Three things in that path were wrong
+  and are fixed: the frontmatter `scope` listed the caller's persona scope
+  although an as-of read never uses it (it now names the graphs actually
+  read, with `neighbourScope` for the neighbourhood queries and a note saying
+  the read is ground-truth only); a holon with a list-mode
+  (`holon:ListAccumulator`) fluent is refused with a 400, because its history
+  is one member per event and the projection would have shown the last member
+  as the whole set; and a timezone-naive `observed_at` is now read as UTC,
+  because against the stored timezone-aware values a naive timestamp within
+  14 hours of an assertion made Fuseki return **no fluent value at all**,
+  silently. `inserted_at` is deliberately not exposed on MCP: nothing writes
+  `hevt:invalidatedAt` and the insertion time is not consulted, so it would
+  be inert. Verified against Jena Fuseki 5.5.0 (see
+  `tests/test_get_holon_asof_live.py`).
+  [PR #37](https://github.com/kurtcagle/holon-bridge-python/pull/37)
 - **Security fix: raw SPARQL could reach graphs the ACL never checked.** A
   caller with no grants could write to a graph through `INSERT { GRAPH ?g ...
   } WHERE { VALUES ?g { <g> } }`, and the old check reported "references no
@@ -310,13 +299,7 @@ hb:release-2026-09-30-g a hb:ReleaseNote ;
 
 hb:release-2026-09-30-h a hb:ReleaseNote ;
     dcterms:date "2026-09-30"^^xsd:date ;
-    rdfs:label "POST /fluent/update requires an identity and write access" ;
-    dcterms:description "The route depended only on the connection, so anyone holding the shared bearer token could change a fluent's value and append to the events ledger, with a free-text asserted_by recorded as fact and fluent, asserted_by and IRI values interpolated into SPARQL unescaped. It now requires an identity and an explicit grantsWrite on the events, scene and sequences graphs (all three are written by one update), sets asserted_by from the authenticated person and refuses a different one, and validates IRIs with delegation.safe_iri. GET /fluent/{id}/prior requires an identity and validates its path parameter. Non-admin callers without those grants now get a 403." ;
-    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/35> .
-
-hb:release-2026-09-30-i a hb:ReleaseNote ;
-    dcterms:date "2026-09-30"^^xsd:date ;
-    rdfs:label "A persona-wide ReadGrant no longer opens another person's private space" ;
-    dcterms:description "A ReadGrant is scoped to a persona, not a person, so it opened every person's private area beneath that persona through /sparql/select, /sparql/construct and GET /graph. In acl.authorize_query, another person's persona-user graph now opens only to an admin or to a holder of an active read delegation naming it; a ReadGrant still opens the caller's own private space and the persona's shared public space. Non-admins who relied on the old behaviour now get a 403 and should be given a delegation by the owner." ;
-    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/36> .
+    rdfs:label "get_holon as-of reads: observed_at on MCP, honest scope, list-fluent guard, UTC-normalised timestamps" ;
+    dcterms:description "The MCP get_holon tool gains observed_at. The as-of path now reports the graphs it actually read in scope (neighbourScope carries the neighbourhood scope, asOf.note says the read is ground-truth only), refuses holons with list-mode fluents with a 400 rather than returning the last member as the set, and reads timezone-naive timestamps as UTC (a naive timestamp within 14 hours of an assertion made Fuseki return no fluent value at all). inserted_at is not exposed on MCP because the transaction-time axis is not yet recorded. Verified on Jena Fuseki 5.5.0." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/37> .
 ```

@@ -38,6 +38,34 @@ graph with the same rank-ordered precedence ``build_state_query`` applies
 to current state, which ``persona_scope.py`` has no equivalent for yet --
 a real gap, not an oversight, and worth its own pass rather than a rushed
 extension here.
+
+CHANGED 2026-09-30: three corrections to the as-of path, made when
+``observed_at`` was first exposed through the MCP ``get_holon`` tool (until
+then only the REST route reached it):
+
+- The projection frontmatter's ``scope`` now reports the graphs an as-of
+  read actually searched for state (the holons and events graphs), not the
+  caller's persona scope, which the as-of query ignores. The scope that the
+  neighbourhood queries did use is reported separately as
+  ``neighbourScope``. Previously an as-of read listed graphs it had not
+  read, which made a ground-truth-only answer look persona-scoped.
+- A holon with a list-mode fluent (``holon:ListAccumulator``) is refused
+  with :class:`AsOfUnsupportedError`. A list fluent's history is a sequence
+  of ``ListInsert``/``ListRemove`` events whose ``hevt:hasValue`` is the
+  single member touched, so the as-of projection would report the last
+  member as if it were the whole set. Refusing is honest; replaying the
+  membership events up to ``observed_at`` is the real fix, and is not done.
+- Timezone-naive ``observed_at``/``inserted_at`` are read as UTC. Stored
+  ``hevt:assertedDateTime`` values are timezone-aware, and SPARQL orders a
+  naive dateTime against an aware one only when they are more than 14 hours
+  apart -- otherwise the comparison is an error and the FILTER silently
+  drops the row, so a naive timestamp would return an empty projection
+  rather than a wrong-looking one.
+
+``inserted_at`` still bounds only ``hevt:invalidatedAt`` (which nothing in
+the bridge writes); the time an assertion was inserted is not consulted.
+The frontmatter says so. Left as is deliberately -- see the as-of note on
+:func:`as_of_query`.
 """
 
 from __future__ import annotations
@@ -62,6 +90,43 @@ PREFIX rdfs:  <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX xsd:   <http://www.w3.org/2001/XMLSchema#>
 """
+
+
+class AsOfUnsupportedError(ValueError):
+    """An as-of read was requested for a holon this bridge cannot
+    reconstruct at a past time. ``fluents`` names the offending fluents."""
+
+    def __init__(self, message: str, *, fluents: list[str]) -> None:
+        super().__init__(message)
+        self.fluents = fluents
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Read a timezone-naive datetime as UTC. See the module docstring."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+async def _list_mode_fluents(
+    client: FusekiClient, conn: Conn, holon_iri: str
+) -> list[str]:
+    """Fluents of ``holon_iri`` whose property is declared
+    ``holon:ListAccumulator`` -- the same holon -> fluent -> FluentProperty
+    -> operation-mode path ``fluent._read_operation_mode`` follows."""
+    query = f"""{_PREFIXES}
+SELECT DISTINCT ?fluent WHERE {{
+  GRAPH <{conn.holons_graph}> {{
+    <{holon_iri}> ?anyPred ?fluent .
+    ?fluent a holon:Fluent ;
+            holon:fluentProperty ?prop .
+  }}
+  GRAPH <{conn.ontology_graph}> {{
+    ?prop holon:fluentOperationMode holon:ListAccumulator .
+  }}
+}}
+ORDER BY ?fluent
+LIMIT 20"""
+    results = await client.select(conn, query)
+    return [row["fluent"]["value"] for row in results.get("results", {}).get("bindings", [])]
 
 
 @dataclass
@@ -182,8 +247,18 @@ async def get_holon(
     eff_observed: datetime | None = None
     eff_inserted: datetime | None = None
     if as_of:
-        eff_observed = observed_at or datetime.now(timezone.utc)
-        eff_inserted = inserted_at or eff_observed
+        eff_observed = _as_utc(observed_at) if observed_at else datetime.now(timezone.utc)
+        eff_inserted = _as_utc(inserted_at) if inserted_at else eff_observed
+        list_fluents = await _list_mode_fluents(client, conn, holon_iri)
+        if list_fluents:
+            raise AsOfUnsupportedError(
+                "as-of reads are not supported for a holon with list-mode "
+                "(holon:ListAccumulator) fluents: the history holds one member per "
+                "event, so the projection would report the last member touched rather "
+                "than the set as it stood. Omit observed_at to read current state. "
+                f"Affected fluents: {', '.join(list_fluents)}",
+                fluents=list_fluents,
+            )
         query = as_of_query(
             conn,
             holon_iri,
@@ -218,8 +293,13 @@ async def get_holon(
         # explicit so a reader can see which scope produced this
         # projection without re-deriving it, especially now that the same
         # holon_iri can legitimately return different content to
-        # different callers.
-        "scope": [g.iri for g in scope],
+        # different callers. An as-of read does not use the persona scope
+        # for state (see the module docstring), so it reports the graphs
+        # as_of_query really reads, and the scope the neighbourhood
+        # queries used goes in ``neighbourScope`` below.
+        "scope": (
+            [conn.holons_graph, conn.graph("events")] if as_of else [g.iri for g in scope]
+        ),
         "projection": {
             "mode": projection_mode,
             "parents": len(parents),
@@ -228,9 +308,16 @@ async def get_holon(
         },
     }
     if as_of:
+        frontmatter["neighbourScope"] = [g.iri for g in scope]
         frontmatter["asOf"] = {
             "observedAt": eff_observed.isoformat() if eff_observed else None,
             "insertedAt": eff_inserted.isoformat() if eff_inserted else None,
+            "note": (
+                "Valid-time read over ground truth only (holons and events graphs); "
+                "persona overlays are not applied to state. insertedAt bounds "
+                "hevt:invalidatedAt only -- the time an assertion was inserted is "
+                "not consulted."
+            ),
         }
 
     book = DataBook(frontmatter=frontmatter, body=_summary(holon_iri, parents, children, peers))

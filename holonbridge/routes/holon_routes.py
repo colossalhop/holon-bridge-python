@@ -24,7 +24,7 @@ from .. import shacl as shacl_mod
 from ..databook import DataBook
 from ..deps import AnimusDep, BanksDep, ClientDep, ConnDep, PersonasDep, SettingsDep
 from ..fuseki import FusekiError
-from ..holon import PROJECTION_MODES, get_holon
+from ..holon import PROJECTION_MODES, AsOfUnsupportedError, get_holon
 from ..ingest import write_turtle_to_graph
 from ..persona_scope import SCOPED_ROLES, resolve_scope_graphs
 from ..turtle import TurtleSyntaxError, from_json_ld, parse
@@ -155,6 +155,8 @@ async def holon(
             observed_at=observed_at,
             inserted_at=inserted_at,
         )
+    except AsOfUnsupportedError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except FusekiError as exc:
         raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
     return book.render()

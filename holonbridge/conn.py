@@ -58,6 +58,17 @@ named query with a prompt template. Deliberately not named
 ``projections`` (already reserved by the unrelated Projection-Hook
 change-delivery feature) or ``projection-log`` -- see
 holonbridge/named_projections.py's module docstring.
+
+CHANGED 2026-09-30: added the ``shacl-context`` graph role and the
+``validation_context_graphs`` property, for context-aware SHACL validation.
+Jena's SHACL service validates one flat graph, so a shape that needs to see
+the ontology (a SPARQL constraint over a property *classified* there, or a
+``sh:class`` check against a class declared there) is either vacuous or
+wrong when the data graph is validated alone. ``shacl-context`` is the second
+shapes graph, holding only shapes that need that context; it is validated
+against the target *merged with* ``validation_context_graphs``. The
+ordinary ``shacl`` graph is unchanged and still validated against the
+target alone. See holonbridge/shacl.py for the mechanism.
 """
 
 from __future__ import annotations
@@ -76,6 +87,7 @@ GRAPH_ROLES: Final = (
     "events",
     "scene",
     "shacl",
+    "shacl-context",
     "named-queries",
     "named-projections",
     "named-rules",
@@ -252,6 +264,27 @@ class Conn:
     @property
     def shapes_graph(self) -> str:
         return self.graph("shacl")
+
+    @property
+    def context_shapes_graph(self) -> str:
+        """The second shapes graph: shapes that only make sense with the
+        ontology visible alongside the data. Optional -- a dataset with no
+        content here is validated exactly as before."""
+        return self.graph("shacl-context")
+
+    @property
+    def validation_context_graphs(self) -> tuple[str, ...]:
+        """Graphs merged into the validation target when the context shapes
+        graph is run. Read-only context: their content is added to a scratch
+        copy and never written to.
+
+        Deliberately just the ontology graph. Validating the union of every
+        graph in the dataset adds noise (materialised projection graphs hold
+        direct values the shapes do not govern) and pulls in graphs a caller
+        may not be entitled to read. Derived from the dataset, never taken
+        from a request, for the same reason.
+        """
+        return (self.ontology_graph,)
 
     @property
     def scene_graph(self) -> str:

@@ -2,9 +2,9 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.1
+version: 1.0.2
 created: 2026-09-27
-updated: 2026-09-29
+updated: 2026-09-30
 author:
   - name: Kurt Cagle
     iri: https://holongraph.com/people/kurt-cagle
@@ -45,6 +45,44 @@ process:
    not needed yet.
 
 ## Log
+
+### 2026-09-30
+
+- **Audit log.** The bridge now records who did what, under what authority,
+  and what it refused. One ASGI middleware (`holonbridge/audit.py`) captures
+  every mutation, every 401/403 and -- at the default `standard` level --
+  "security reads" (a read under `act_as`, `GET /holon?on_behalf_of=`, or of
+  another person's private persona graph). Entries carry the acting person
+  (and the real person behind an `act_as`), the target graphs, the write
+  mode, what authorised the write (grant, delegation or admin bypass) and
+  the reason for any refusal. Payloads are never stored, only a `sha256`
+  digest and a size. Entries live in `urn:{dataset}:audit`, in an
+  `hb:AuditEntry` vocabulary kept separate from `hev:AssertionEvent` domain
+  events. **Nobody can write that graph through the API, admin included**
+  (`acl.check_write`/`check_replace` refuse it before the admin bypass), and
+  only admins can read it, through the new `GET /audit`, `GET /audit/level`,
+  `POST /audit/level` and the `list_audit` / `get_audit_level` /
+  `set_audit_level` MCP tools. Per-dataset levels `off` < `denials` <
+  `mutations` < `standard`; a level change is always recorded. Fails open
+  (a failed audit write is logged, never fails the request). See the PR for
+  the known gaps. [PR #31](https://github.com/kurtcagle/holon-bridge-python/pull/31)
+- **`GET /graph?iri=` now refuses the audit graph.** That route has no
+  identity check of its own, so without this the audit graph would have been
+  readable by anyone holding the shared bearer token.
+  [PR #31](https://github.com/kurtcagle/holon-bridge-python/pull/31)
+- **Delegation follow-ups.** `POST /admin/person/deactivate` now revokes
+  every still-live delegation the Person gave or received, in the same
+  atomic update, and returns them as `delegations_revoked`; reactivating a
+  Person does not revive them. `write_turtle_to_graph` (and so
+  `/graph/push`, `POST /holon`, `/message/create`) now reports
+  `authorisedBy` / `authorisedReason` in its response, so a delegated write
+  is distinguishable from the owner's own.
+  [PR #30](https://github.com/kurtcagle/holon-bridge-python/pull/30)
+- **MCP `get_holon` and `sparql_construct` return `str | dict`.** A refusal
+  (for example a 403) used to fail FastMCP's output validation and surface as
+  an opaque "Input should be a valid string" error instead of the bridge's
+  reason. [PR #28](https://github.com/kurtcagle/holon-bridge-python/pull/28),
+  [PR #29](https://github.com/kurtcagle/holon-bridge-python/pull/29)
 
 ### 2026-09-29
 
@@ -155,4 +193,28 @@ hb:release-2026-09-29-c a hb:ReleaseNote ;
     rdfs:label "Request-supplied IRIs validated before reaching generated Turtle or SPARQL" ;
     dcterms:description "delegation.safe_iri refuses characters that could change a generated statement's structure, and literals now escape control characters. Regression tests fail if either layer is removed." ;
     rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/27> .
+
+hb:release-2026-09-30-a a hb:ReleaseNote ;
+    dcterms:date "2026-09-30"^^xsd:date ;
+    rdfs:label "Audit log: mutations, refusals and security reads" ;
+    dcterms:description "Added holonbridge/audit.py (an ASGI middleware, per-dataset levels off/denials/mutations/standard, hb:AuditEntry vocabulary), routes/audit.py (GET /audit, GET and POST /audit/level) and the list_audit, get_audit_level and set_audit_level MCP tools. Entries record actor, real actor under act_as, target graphs, write mode, authority and refusal reason, with a payload digest and never the payload. The audit graph cannot be written through the API by anyone, admin included, and is readable by admins only. Fails open." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/31> .
+
+hb:release-2026-09-30-b a hb:ReleaseNote ;
+    dcterms:date "2026-09-30"^^xsd:date ;
+    rdfs:label "GET /graph refuses the audit graph" ;
+    dcterms:description "GET /graph?iri= has no identity check of its own, so it now refuses the audit graph explicitly; that graph is read through the admin-only GET /audit." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/31> .
+
+hb:release-2026-09-30-c a hb:ReleaseNote ;
+    dcterms:date "2026-09-30"^^xsd:date ;
+    rdfs:label "Delegation follow-ups: deactivate revokes delegations; writes report authorisedBy" ;
+    dcterms:description "deactivate_person revokes every live delegation the Person gave or received in the same atomic update and returns delegations_revoked; write_turtle_to_graph responses now include authorisedBy and authorisedReason." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/30> .
+
+hb:release-2026-09-30-d a hb:ReleaseNote ;
+    dcterms:date "2026-09-30"^^xsd:date ;
+    rdfs:label "MCP get_holon and sparql_construct return str | dict" ;
+    dcterms:description "A refusal used to fail FastMCP's output validation and surface as an opaque validation error; the tools now return the bridge's error object." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/29> .
 ```

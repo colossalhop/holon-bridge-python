@@ -2,7 +2,7 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.2
+version: 1.0.3
 created: 2026-09-27
 updated: 2026-09-30
 author:
@@ -48,6 +48,17 @@ process:
 
 ### 2026-09-30
 
+- **Security fix: `GET /graph?iri=` now requires an identity and applies the
+  `/sparql/select` read rules.** It previously had no identity check at all,
+  so anyone holding the shared bearer token could read any graph in full --
+  other people's private persona graphs, delegations, grants and the audit
+  log. A persona graph now needs a `ReadGrant`, an admin bypass or a read
+  delegation; the audit graph is admin-only; ground truth stays readable by
+  any identified caller. **Behaviour change:** callers sending only the
+  bearer token now get a 401. A refused read is audited with its reason, and
+  a read of another person's private graph is recorded as a security read.
+  `GET /graphs` (names and counts only) is unchanged.
+  [PR #32](https://github.com/kurtcagle/holon-bridge-python/pull/32)
 - **Audit log.** The bridge now records who did what, under what authority,
   and what it refused. One ASGI middleware (`holonbridge/audit.py`) captures
   every mutation, every 401/403 and -- at the default `standard` level --
@@ -66,10 +77,6 @@ process:
   `mutations` < `standard`; a level change is always recorded. Fails open
   (a failed audit write is logged, never fails the request). See the PR for
   the known gaps. [PR #31](https://github.com/kurtcagle/holon-bridge-python/pull/31)
-- **`GET /graph?iri=` now refuses the audit graph.** That route has no
-  identity check of its own, so without this the audit graph would have been
-  readable by anyone holding the shared bearer token.
-  [PR #31](https://github.com/kurtcagle/holon-bridge-python/pull/31)
 - **Delegation follow-ups.** `POST /admin/person/deactivate` now revokes
   every still-live delegation the Person gave or received, in the same
   atomic update, and returns them as `delegations_revoked`; reactivating a
@@ -217,4 +224,10 @@ hb:release-2026-09-30-d a hb:ReleaseNote ;
     rdfs:label "MCP get_holon and sparql_construct return str | dict" ;
     dcterms:description "A refusal used to fail FastMCP's output validation and surface as an opaque validation error; the tools now return the bridge's error object." ;
     rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/29> .
+
+hb:release-2026-09-30-e a hb:ReleaseNote ;
+    dcterms:date "2026-09-30"^^xsd:date ;
+    rdfs:label "GET /graph requires an identity and applies the /sparql/select read rules" ;
+    dcterms:description "GET /graph?iri= previously had no identity check, so anyone with the shared bearer token could read any graph in full. It now depends on AnimusDep and runs acl.authorize_query on a probe for that one graph: a persona graph needs a ReadGrant, an admin bypass or a read delegation, the audit graph is admin-only, and ground truth is readable by any identified caller. Callers sending only the bearer token now get a 401. Supersedes the audit-graph-only refusal from PR 31." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/32> .
 ```

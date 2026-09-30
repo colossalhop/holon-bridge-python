@@ -26,7 +26,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
-from . import delegation
+from . import audit, delegation
 
 # A query function: given a SPARQL SELECT/ASK string, return SPARQL-JSON
 # bindings (the same shape python's own FusekiClient.select already returns).
@@ -395,6 +395,10 @@ async def check_write(
     allows the write (see ``delegation.find_delegation``). Not applicable
     to a scratch target: a delegation covers a delegator's own
     persona-user graphs, never the scratch namespace."""
+    # The audit graph is written by the bridge itself and by nobody else,
+    # admins included -- so this comes before the admin bypass.
+    if audit.is_audit_graph(target, holons_graph):
+        return AclDecision(False, "the audit graph is written only by the bridge itself", person)
     if await is_admin(query_fn, holons_graph, person=person):
         return AclDecision(True, "admin role bypass", person)
     grant_target = (
@@ -461,6 +465,8 @@ async def check_replace(
     here, and cannot be made to be -- delegation.PERMISSIONS has no
     "replace". Holding a write delegation, like holding grantsWrite,
     confers nothing on this path."""
+    if audit.is_audit_graph(target, holons_graph):
+        return AclDecision(False, "the audit graph is written only by the bridge itself", person)
     if await is_admin(query_fn, holons_graph, person=person):
         return AclDecision(True, "admin role bypass", person)
     grant_target = (
@@ -663,6 +669,12 @@ async def authorize_query(
         return AclDecision(False, "query could not be parsed for graph references; denied, not assumed safe", person)
 
     for graph_iri in refs:
+        if audit.is_audit_graph(graph_iri, holons_graph):
+            # Not a persona graph, so it would otherwise fall through as
+            # "org ground truth, always readable". Admins only.
+            if await is_admin(query_fn, holons_graph, person=person):
+                continue
+            return AclDecision(False, "the audit graph is readable by admins only", person)
         persona = persona_of_graph(graph_iri)
         if persona is None:
             continue  # org ground truth or a graph outside the persona scheme

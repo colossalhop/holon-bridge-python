@@ -33,6 +33,14 @@ Jena transaction. The ACL check itself stays outside the lock: it is a
 plain read with no write-then-confirm shape, so serialising it buys
 nothing and would only add latency ahead of the lock for every caller,
 including ones that end up 403'd before ever touching SHACL.
+
+CHANGED 2026-09-30: the returned dict now carries ``authorisedBy`` (the
+grant target for an explicit ``holon:grantsWrite``/``grantsReplace``, the
+``holon:Delegation`` IRI when the write was allowed by a delegation, and
+``None`` for the admin bypass) and ``authorisedReason``. A delegated write
+is otherwise indistinguishable from the delegator's own in the response.
+This is response-level attribution only; nothing extra is written to the
+graph, so the stored data still does not record who wrote it.
 """
 
 from __future__ import annotations
@@ -157,4 +165,6 @@ async def write_turtle_to_graph(
         "mode": mode,
         "validated": bool(resolved_shapes_graph),
         "validation": report_payload,
+        "authorisedBy": decision.matched_grant,
+        "authorisedReason": decision.reason,
     }

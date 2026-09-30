@@ -2,7 +2,7 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.5
+version: 1.0.6
 created: 2026-09-27
 updated: 2026-09-30
 author:
@@ -48,6 +48,24 @@ process:
 
 ### 2026-09-30
 
+- **`get_holon` can now read as of a past time, and the as-of read stopped
+  misleading.** The MCP `get_holon` tool gains `observed_at` (ISO 8601), so an
+  LLM client can ask what a holon's fluents were worth at a given moment;
+  until now only the REST route could. Three things in that path were wrong
+  and are fixed: the frontmatter `scope` listed the caller's persona scope
+  although an as-of read never uses it (it now names the graphs actually
+  read, with `neighbourScope` for the neighbourhood queries and a note saying
+  the read is ground-truth only); a holon with a list-mode
+  (`holon:ListAccumulator`) fluent is refused with a 400, because its history
+  is one member per event and the projection would have shown the last member
+  as the whole set; and a timezone-naive `observed_at` is now read as UTC,
+  because against the stored timezone-aware values a naive timestamp within
+  14 hours of an assertion made Fuseki return **no fluent value at all**,
+  silently. `inserted_at` is deliberately not exposed on MCP: nothing writes
+  `hevt:invalidatedAt` and the insertion time is not consulted, so it would
+  be inert. Verified against Jena Fuseki 5.5.0 (see
+  `tests/test_get_holon_asof_live.py`).
+  [PR #37](https://github.com/kurtcagle/holon-bridge-python/pull/37)
 - **Security fix: raw SPARQL could reach graphs the ACL never checked.** A
   caller with no grants could write to a graph through `INSERT { GRAPH ?g ...
   } WHERE { VALUES ?g { <g> } }`, and the old check reported "references no
@@ -278,4 +296,10 @@ hb:release-2026-09-30-g a hb:ReleaseNote ;
     rdfs:label "Raw SPARQL can no longer reach graphs the ACL never checked" ;
     dcterms:description "acl.analyse_graph_refs classifies every graph position in a query or update (concrete, wholesale, dynamic) and acl.authorize_update applies the rules. Previously GRAPH ?g however bound, FROM/FROM NAMED, WITH, USING and DROP/CLEAR/CREATE/COPY/MOVE/ADD/LOAD all reported no graph and were allowed; a live test wrote to a graph with no grant via INSERT { GRAPH ?g } WHERE { VALUES }. Wholesale operations need grantsReplace, default-graph writes and LOAD are admin-only, dynamic reads are refused to non-admins and dynamic updates to everyone, admins included." ;
     rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/34> .
+
+hb:release-2026-09-30-h a hb:ReleaseNote ;
+    dcterms:date "2026-09-30"^^xsd:date ;
+    rdfs:label "get_holon as-of reads: observed_at on MCP, honest scope, list-fluent guard, UTC-normalised timestamps" ;
+    dcterms:description "The MCP get_holon tool gains observed_at. The as-of path now reports the graphs it actually read in scope (neighbourScope carries the neighbourhood scope, asOf.note says the read is ground-truth only), refuses holons with list-mode fluents with a 400 rather than returning the last member as the set, and reads timezone-naive timestamps as UTC (a naive timestamp within 14 hours of an assertion made Fuseki return no fluent value at all). inserted_at is not exposed on MCP because the transaction-time axis is not yet recorded. Verified on Jena Fuseki 5.5.0." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/37> .
 ```

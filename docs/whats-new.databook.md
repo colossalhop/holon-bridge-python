@@ -2,7 +2,7 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.8
+version: 1.0.9
 created: 2026-09-27
 updated: 2026-09-30
 author:
@@ -48,6 +48,21 @@ process:
 
 ### 2026-09-30
 
+- **Fluent updates: a transition is confirmed by its own ledger entry.**
+  `update_fluent` confirmed a transition by comparing the scene graph's
+  current assertion with its own, which was wrong three ways: list-mode
+  fluents never have one, so every `ListInsert`/`ListRemove` wrote its member,
+  failed to confirm and looped to the attempt limit (8 ledger entries, then an
+  error); a third writer landing between a transition's commit and its read-back
+  made the winner retry and apply its operation a second time (an `Insert` delta
+  counted twice); and `newValue` could be someone else's value. Since #41 the
+  ledger entry exists exactly when the transition fired, so confirmation now asks
+  the ledger for the transition's own entry. A `ListRemove` of a non-member is
+  refused up front, and `POST /fluent/update` now returns 409 instead of a bare
+  500 when the id minter exhausts its retries, as `/sequence/mint` does.
+  Tested against rdflib's SPARQL engine, not Jena: 8 of 9 new tests fail on the
+  previous code.
+  [PR #42](https://github.com/kurtcagle/holon-bridge-python/pull/42)
 - **Fluent updates: a lost race no longer leaves an orphan ledger entry.**
   `update_fluent` runs a ledger append and a scene update in one request. The
   scene update was a compare-and-set, but the ledger append beside it was an
@@ -350,4 +365,10 @@ hb:release-2026-09-30-j a hb:ReleaseNote ;
     rdfs:label "Fluent updates: a lost race no longer leaves an orphan ledger entry" ;
     dcterms:description "update_fluent ran a compare-and-set scene update beside an unconditional INSERT DATA ledger append in one request, so when two transitions on a fluent read the same current value the loser's scene update correctly no-opped while its ledger entry still landed, leaving two live StateAssertions. The ledger append now carries the same WHERE guard as the scene update, so a loser writes neither half and retries as before, and the pre-commit trial substitutes the scene graph IRI in the ledger statement as well. Tested against a real SPARQL engine (rdflib, not Jena): 5 of 9 new tests fail on the old code. Does not repair existing orphans; the PR has a detection query. Left alone: list-mode operations cannot confirm (8 ledger entries, then an error), and a possible double application under three-way interleaving." ;
     rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/41> .
+
+hb:release-2026-09-30-k a hb:ReleaseNote ;
+    dcterms:date "2026-09-30"^^xsd:date ;
+    rdfs:label "Fluent updates: a transition is confirmed by its own ledger entry; mint exhaustion is a 409" ;
+    dcterms:description "update_fluent confirmed a transition by comparing the scene graph's current assertion with its own, which failed for list-mode fluents (they never have one, so every ListInsert/ListRemove looped to the attempt limit writing 8 ledger entries, then raised), made a winner retry and re-apply its operation when a third writer landed before its read-back (an Insert delta counted twice), and could report someone else's value as newValue. Since PR 41 a transition's ledger entry exists exactly when it fired, so confirmation now asks the ledger for the transition's own entry. A ListRemove of a non-member is refused up front before an id is minted, and POST /fluent/update now maps SequenceError to a 409 like /sequence/mint instead of a bare 500. Tested against rdflib's SPARQL engine, not Jena: 8 of 9 new tests fail on the previous code." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/42> .
 ```

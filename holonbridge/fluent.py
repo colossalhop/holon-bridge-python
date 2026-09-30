@@ -94,6 +94,29 @@ StateTrigger is evaluated on every fluent transition, which is correct
 but not the cheapest it could be -- see ``triggers.py``'s module
 docstring for why that's an explicit, deferred choice rather than an
 oversight.
+
+CHANGED 2026-09-30: fixed a lost-race bug that left an orphan ledger entry.
+The scene update has always been a compare-and-set, but the ledger append
+beside it was an unconditional ``INSERT DATA``. When two transitions on one
+fluent both read the same current value, the loser's scene update was a
+correct no-op while its ledger entry still landed -- superseding the same
+predecessor as the winner's, and itself superseded by nothing. The fluent
+then had two live StateAssertions (the same condition
+``holon:StateAssertionNonOverlapShape`` exists to forbid), so on a gated
+dataset the pre-commit check, which scopes to every unsuperseded assertion
+for the fluent, would see the orphan beside the real one. The module
+docstring's claim above -- never a ledger entry with no matching scene update
+-- held only for a winner.
+
+The ledger append is now ``INSERT { ... } WHERE { GRAPH <scene> { guard } }``,
+using the SAME guard as the scene update. Both operations sit in one request
+and one transaction, and the first does not touch the scene graph, so the
+guard evaluates identically for both: either the transition fires as a whole
+or neither half does. A loser therefore leaves nothing behind, and the
+confirmation read-back below retries it exactly as before.
+``_precommit_check`` now substitutes the scene graph IRI in the ledger
+statement as well, since that statement now reads the scene graph. Only the
+guard is shared; nothing else about the two statements changed.
 """
 
 from __future__ import annotations
@@ -304,7 +327,14 @@ async def _precommit_check(
     scratch_events = f"urn:{conn.dataset}:scratch:fluent-{token}:events"
     scratch_scene = f"urn:{conn.dataset}:scratch:fluent-{token}:scene"
 
-    trial_ledger = ledger_insert.replace(f"<{events_graph}>", f"<{scratch_events}>")
+    # The ledger statement reads the scene graph (its guard) as well as writing
+    # the events graph, so BOTH IRIs are substituted in it. Left pointing at the
+    # live scene graph it would still run, and still match, because the scratch
+    # copy equals the live graph at this moment -- but it would be reading live
+    # state, not the copy this check is meant to be confined to.
+    trial_ledger = ledger_insert.replace(f"<{events_graph}>", f"<{scratch_events}>").replace(
+        f"<{scene_graph}>", f"<{scratch_scene}>"
+    )
     trial_scene = scene_update.replace(f"<{scene_graph}>", f"<{scratch_scene}>")
 
     try:
@@ -427,10 +457,22 @@ async def update_fluent(
         ]
         clause_body = " ;\n    ".join(c for c in clauses if c)
 
-        ledger_insert = f"""INSERT DATA {{
+        # The ledger append carries the SAME guard as the scene update below,
+        # so a transition that loses the race writes neither half. It used to
+        # be an unconditional INSERT DATA, which left an orphan StateAssertion
+        # behind whenever the scene update correctly no-opped -- see the
+        # module docstring's 2026-09-30 note. The guard is evaluated against
+        # the scene graph, which this statement does not modify, so it sees
+        # the same state the scene update will.
+        ledger_insert = f"""INSERT {{
   GRAPH <{events_graph}> {{
     <{assertion_iri}>
     {clause_body} .
+  }}
+}}
+WHERE {{
+  GRAPH <{scene_graph}> {{
+    {guard_clause}
   }}
 }}"""
 
@@ -486,7 +528,8 @@ WHERE {{
             # read, same as sequence.mint(). This is a live-commit
             # concurrency loss, distinct from a pre-commit shapes
             # rejection above -- the latter is never worth retrying, since
-            # the same violation would just recur.
+            # the same violation would just recur. Nothing of ours was
+            # written: the ledger append shares the scene update's guard.
             continue
 
         await _evaluate_state_triggers(client, conn, fluent=fluent)

@@ -2,7 +2,7 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.6
+version: 1.0.7
 created: 2026-09-27
 updated: 2026-09-30
 author:
@@ -48,6 +48,25 @@ process:
 
 ### 2026-09-30
 
+- **SHACL: a second, ontology-aware shapes graph.** Jena validates one flat
+  graph, so a shape that needs the ontology visible -- a constraint over a
+  property *classified* there, or a `sh:class` check against a class declared
+  there -- was either vacuous (no focus node in the data graph) or wrong (a
+  false violation on every correct node). A dataset may now keep
+  `urn:{dataset}:shacl-context` (new graph role `shacl-context`), validated
+  against the target **merged with the dataset's ontology** in a scratch copy;
+  the ordinary `shacl` graph is unchanged. When a write names no
+  `shapes_graph` of its own, both packs run and either can return a 422, each
+  result tagged with its `pack`. Context is added after any reduction rule,
+  and in delta mode the baseline is built with the context too, so a violation
+  the ontology itself carries is never blamed on the payload. `POST /validate`
+  and MCP `validate_turtle` gain `context` (default on, mirroring the write
+  path) and `merge_context`. A dataset with no context shapes behaves exactly
+  as before. Measured on the Bridgerton data: the holons graph alone gave 0
+  violations for a planted bad write and 25 false ones for correct fluents;
+  with the ontology merged in it caught the planted write and the 25 went
+  away. Not fixed here: `POST /validate` has no identity check (see the PR).
+  [PR #40](https://github.com/kurtcagle/holon-bridge-python/pull/40)
 - **`get_holon` can now read as of a past time, and the as-of read stopped
   misleading.** The MCP `get_holon` tool gains `observed_at` (ISO 8601), so an
   LLM client can ask what a holon's fluents were worth at a given moment;
@@ -302,4 +321,10 @@ hb:release-2026-09-30-h a hb:ReleaseNote ;
     rdfs:label "get_holon as-of reads: observed_at on MCP, honest scope, list-fluent guard, UTC-normalised timestamps" ;
     dcterms:description "The MCP get_holon tool gains observed_at. The as-of path now reports the graphs it actually read in scope (neighbourScope carries the neighbourhood scope, asOf.note says the read is ground-truth only), refuses holons with list-mode fluents with a 400 rather than returning the last member as the set, and reads timezone-naive timestamps as UTC (a naive timestamp within 14 hours of an assertion made Fuseki return no fluent value at all). inserted_at is not exposed on MCP because the transaction-time axis is not yet recorded. Verified on Jena Fuseki 5.5.0." ;
     rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/37> .
+
+hb:release-2026-09-30-i a hb:ReleaseNote ;
+    dcterms:date "2026-09-30"^^xsd:date ;
+    rdfs:label "SHACL: a second, ontology-aware shapes graph (context pack)" ;
+    dcterms:description "A dataset may keep urn:{dataset}:shacl-context (new graph role shacl-context), validated against the target merged with the dataset's ontology in a scratch copy, because Jena's SHACL service validates one flat graph and a shape that needs the ontology visible is otherwise vacuous or wrong. Writes naming no shapes_graph run both packs and either can return a 422, each result tagged with its pack; context is added after any reduction rule and, in delta mode, to the baseline as well so the ontology's own violations are not blamed on the payload. POST /validate and MCP validate_turtle gain context and merge_context. No context shapes graph means unchanged behaviour. Not fixed here: POST /validate has no identity check." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/40> .
 ```

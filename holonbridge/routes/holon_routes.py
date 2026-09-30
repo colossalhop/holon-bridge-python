@@ -8,6 +8,15 @@ the DataBook's own ``graph.named_graph`` frontmatter, and hand off to
 ``holonbridge.ingest.write_turtle_to_graph`` -- the exact same ACL/SHACL/
 write path ``POST /graph/push`` uses. See that module's docstring for why
 this is a wrapper and not a second implementation.
+
+CHANGED 2026-09-30: ``POST /validate`` understands the dataset's context
+shapes graph. With no ``shapes_graph`` named it now runs the ordinary shapes
+AND (if the dataset has one) the context pack, exactly as the write path does
+-- so a preview and a write agree. ``merge_context`` validates a named shapes
+graph against the target with the dataset's context graphs merged in, for
+trying a context pack before it is installed. Which graphs are merged is
+decided by the dataset (``Conn.validation_context_graphs``), never by the
+request. See ``holonbridge.shacl`` for the mechanism.
 """
 
 from __future__ import annotations
@@ -277,6 +286,26 @@ class ValidateRequest(BaseModel):
         description="validate merged with this graph; required for delta mode",
     )
     mode: str = Field(default="auto", pattern="^(auto|full|delta)$")
+    context: bool = Field(
+        default=True,
+        description=(
+            "When no shapes_graph is named, also run the dataset's context "
+            "shapes graph (urn:{dataset}:shacl-context) against the target "
+            "merged with the dataset's context graphs, exactly as the write "
+            "path does. Ignored when shapes_graph is given. A dataset with no "
+            "context shapes is unaffected."
+        ),
+    )
+    merge_context: bool = Field(
+        default=False,
+        description=(
+            "Validate shapes_graph against the target with the dataset's "
+            "context graphs (its ontology) merged in, in a single run. For "
+            "trying a context pack before it is installed, or any shapes "
+            "graph that needs the ontology visible. The graphs merged are the "
+            "dataset's own; a request cannot name others."
+        ),
+    )
 
 
 @router.post("/validate")
@@ -293,6 +322,9 @@ async def validate(
             status.HTTP_400_BAD_REQUEST, detail="delta mode requires target_graph"
         )
 
+    context_graphs = conn.validation_context_graphs if body.merge_context else ()
+
+    context_report = None
     try:
         if mode == "delta":
             report = await shacl_mod.validate_delta(
@@ -301,6 +333,7 @@ async def validate(
                 turtle=body.turtle,
                 shapes_graph=shapes_graph,
                 target_graph=body.target_graph,  # type: ignore[arg-type]
+                context_graphs=context_graphs,
             )
         else:
             report = await shacl_mod.validate_full(
@@ -309,13 +342,36 @@ async def validate(
                 turtle=body.turtle,
                 shapes_graph=shapes_graph,
                 target_graph=body.target_graph,
+                context_graphs=context_graphs,
+            )
+        # Like the write path: with no shapes graph named, the dataset's own
+        # context pack runs too. merge_context already folds the ontology into
+        # this run, so it opts out of the separate pack.
+        if body.context and body.shapes_graph is None and not body.merge_context:
+            context_report = await shacl_mod.validate_context_pack(
+                client,
+                conn,
+                turtle=body.turtle,
+                target_graph=body.target_graph,
+                delta=(mode == "delta"),
             )
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except FusekiError as exc:
         raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
 
-    return {"shapes_graph": shapes_graph, **report.as_dict()}
+    out = {
+        "shapes_graph": shapes_graph,
+        **shacl_mod.combine_reports(
+            report,
+            context_report,
+            context_shapes_graph=conn.context_shapes_graph,
+            context_graphs=conn.validation_context_graphs,
+        ),
+    }
+    if context_graphs:
+        out["context_graphs"] = list(context_graphs)
+    return out
 
 
 # --- sequences ----------------------------------------------------------------

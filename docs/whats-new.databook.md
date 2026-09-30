@@ -2,7 +2,7 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.4
+version: 1.0.5
 created: 2026-09-27
 updated: 2026-09-30
 author:
@@ -48,6 +48,23 @@ process:
 
 ### 2026-09-30
 
+- **Security fix: raw SPARQL could reach graphs the ACL never checked.** A
+  caller with no grants could write to a graph through `INSERT { GRAPH ?g ...
+  } WHERE { VALUES ?g { <g> } }`, and the old check reported "references no
+  graph" -- so allowed -- for `GRAPH ?g` however `?g` was bound, `FROM` /
+  `FROM NAMED`, `WITH`, `USING`, and `DROP` / `CLEAR` / `CREATE` / `COPY` /
+  `MOVE` / `ADD` / `LOAD`. New `acl.analyse_graph_refs` classifies every graph
+  position (concrete, wholesale, dynamic) and new `acl.authorize_update`
+  applies the rules: wholesale operations need `grantsReplace`; default-graph
+  writes and `LOAD` are admin-only; a dynamic position (`GRAPH ?g`,
+  `SERVICE ?v`, `DROP ALL`) is refused to non-admins for reads and to
+  **everyone, admins included,** for updates, because the audit graph's
+  per-graph protection cannot see through an update that names no graph.
+  **Behaviour change:** non-admin queries using `GRAPH ?g` now return 403,
+  and admins can no longer run `DROP ALL` or an update with `GRAPH ?g`; name
+  the graphs. Restricting `GRAPH ?g` to the graphs a caller may read (via
+  `FROM NAMED`) is left as a later hardening item.
+  [PR #34](https://github.com/kurtcagle/holon-bridge-python/pull/34)
 - **Audit: who may turn it down, and how.** A live test showed an admin could
   silence the log with one plain SPARQL update to the `meta` graph, and that
   update went unrecorded. The setting now lives in a bridge-owned graph,
@@ -255,4 +272,10 @@ hb:release-2026-09-30-f a hb:ReleaseNote ;
     rdfs:label "Audit: bridge-owned config, an API floor, time-boxed suspensions, operator levels" ;
     dcterms:description "The audit setting moved from the admin-writable meta graph to urn:{dataset}:audit:config, protected like the audit graph. POST /audit/level accepts only mutations, standard or default; off and denials are either a time-boxed POST /audit/suspend (mandatory reason, at most 240 minutes, self-reverting, start and end recorded) or an operator decision via HOLONBRIDGE_AUDIT_LEVEL / HOLONBRIDGE_AUDIT_LEVELS. Also fixed GET /audit omitting hb:reason. set_audit_level('off') now returns a 400." ;
     rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/33> .
+
+hb:release-2026-09-30-g a hb:ReleaseNote ;
+    dcterms:date "2026-09-30"^^xsd:date ;
+    rdfs:label "Raw SPARQL can no longer reach graphs the ACL never checked" ;
+    dcterms:description "acl.analyse_graph_refs classifies every graph position in a query or update (concrete, wholesale, dynamic) and acl.authorize_update applies the rules. Previously GRAPH ?g however bound, FROM/FROM NAMED, WITH, USING and DROP/CLEAR/CREATE/COPY/MOVE/ADD/LOAD all reported no graph and were allowed; a live test wrote to a graph with no grant via INSERT { GRAPH ?g } WHERE { VALUES }. Wholesale operations need grantsReplace, default-graph writes and LOAD are admin-only, dynamic reads are refused to non-admins and dynamic updates to everyone, admins included." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/34> .
 ```

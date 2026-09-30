@@ -510,64 +510,191 @@ def _literal(value: str) -> str:
 # Query-graph-reference extraction (best-effort, fail-closed on the caller)
 # --------------------------------------------------------------------------
 
-def extract_graph_refs(sparql_text: str) -> set[str] | None:
-    """Every graph IRI this SPARQL query or update references, so a request
-    that reaches beyond the ``graph`` field it declared can still be caught.
+@dataclass(frozen=True)
+class GraphAnalysis:
+    """Every way a SPARQL query or update can reach a graph, as seen in the
+    parsed algebra.
+
+    ``refs`` are concrete graphs named anywhere (GRAPH <g>, FROM/FROM NAMED,
+    WITH, USING/USING NAMED, INSERT/DELETE quads, LOAD ... INTO). ``replace_refs``
+    are graphs hit by a *wholesale* operation (DROP, CLEAR, CREATE, and both
+    ends of COPY/MOVE/ADD) -- the same shape ``check_replace`` exists for.
+    ``dynamic`` means some graph position is not a fixed IRI (``GRAPH ?g``
+    however ``?g`` gets bound -- VALUES, BIND, a subquery -- ``SERVICE ?v``, or
+    ``ALL``/``NAMED``): what it reaches cannot be known before it runs, so it
+    cannot be authorised. ``default_write`` means an update writes or clears the
+    default graph. ``admin_only_ops`` names operations that are admin-only
+    outright (LOAD fetches a remote URL).
+    """
+
+    refs: frozenset[str] = frozenset()
+    replace_refs: frozenset[str] = frozenset()
+    dynamic: bool = False
+    default_write: bool = False
+    admin_only_ops: tuple[str, ...] = ()
+
+    @property
+    def all_refs(self) -> frozenset[str]:
+        return self.refs | self.replace_refs
+
+
+class _Collector:
+    def __init__(self) -> None:
+        self.refs: set[str] = set()
+        self.replace_refs: set[str] = set()
+        self.dynamic = False
+        self.default_write = False
+        self.admin_ops: set[str] = set()
+
+    def term(self, value: object, *, wholesale: bool = False) -> None:
+        """Classify one graph position. Anything that is not a fixed IRI or
+        the default graph is dynamic -- fail closed."""
+        from rdflib.term import URIRef
+
+        if isinstance(value, URIRef):
+            (self.replace_refs if wholesale else self.refs).add(str(value))
+        elif value == "DEFAULT":
+            self.default_write = True
+        else:  # a Variable, "ALL", "NAMED", or anything we do not recognise
+            self.dynamic = True
+
+
+_WHOLESALE_SINGLE = frozenset({"Drop", "Clear", "Create"})
+_WHOLESALE_PAIR = frozenset({"Copy", "Move", "Add"})
+
+#: ``GraphGraphPattern`` is the parse-tree name for ``GRAPH <x> { ... }``.
+#: rdflib leaves the pattern inside FILTER EXISTS / NOT EXISTS untranslated, so
+#: a graph position there is never a ``Graph`` algebra node.
+_GRAPH_PATTERNS = frozenset({"Graph", "GraphGraphPattern", "ServiceGraphPattern"})
+
+
+def _field(node: object, key: str) -> object:
+    """``node[key]`` if it is there, else ``None``.
+
+    Not ``node.get(key)``: rdflib's ``CompValue.get`` returns the *key name
+    itself* for a missing key, which reads as a plausible value and, here,
+    as a graph position that is not an IRI.
+    """
+    try:
+        return node[key] if key in node else None  # type: ignore[operator, index]
+    except Exception:
+        return None
+
+
+def _collect(node: object, acc: _Collector, seen: set[int]) -> None:
+    if id(node) in seen:
+        return
+    seen.add(id(node))
+    name = getattr(node, "name", None)
+
+    if name in _GRAPH_PATTERNS:
+        acc.term(_field(node, "term"))
+    elif name in ("DatasetClause", "UsingClause"):
+        for key in ("default", "named"):
+            if _field(node, key) is not None:
+                acc.term(_field(node, key))
+    elif name in _WHOLESALE_SINGLE:
+        acc.term(_field(node, "graphiri"), wholesale=True)
+    elif name in _WHOLESALE_PAIR:
+        for graph in _field(node, "graph") or []:  # type: ignore[union-attr]
+            acc.term(graph, wholesale=True)
+    elif name == "Load":
+        acc.admin_ops.add("LOAD")
+        target = _field(node, "graphiri")
+        if target is None:
+            acc.default_write = True
+        else:
+            acc.term(target)
+    elif name == "Modify":
+        with_graph = _field(node, "withClause")
+        if with_graph is not None:
+            acc.term(with_graph)
+        for part in ("delete", "insert"):
+            clause = _field(node, part)
+            if clause is not None and _field(clause, "triples") and with_graph is None:
+                acc.default_write = True
+    elif name in ("InsertData", "DeleteData", "DeleteWhere"):
+        if _field(node, "triples"):
+            acc.default_write = True
+
+    if hasattr(node, "keys") and callable(node.keys):
+        for key in list(node.keys()):
+            value = node[key]
+            if key == "quads" and isinstance(value, dict):
+                for graph_ref in value.keys():
+                    acc.term(graph_ref)
+                continue
+            _collect(value, acc, seen)
+    elif isinstance(node, (list, tuple)):
+        for value in node:
+            _collect(value, acc, seen)
+
+
+def analyse_graph_refs(sparql_text: str) -> GraphAnalysis | None:
+    """Parse ``sparql_text`` (query or update) and report every way it reaches
+    a graph -- see :class:`GraphAnalysis`.
 
     Works against the SPARQL *algebra* (``translateQuery``/``translateUpdate``),
-    not the raw parse tree -- the algebra is what rdflib itself executes, so
-    a graph reference this function misses is a graph reference the engine
-    wouldn't have executed either. Handles GRAPH clauses and SERVICE targets
-    in queries, and the ``quads`` dict rdflib builds for INSERT DATA,
-    DELETE WHERE, and DELETE/INSERT/WHERE.
+    which is what rdflib itself executes, so a reference this misses is one
+    the engine would not have executed either.
 
-    Returns ``None`` if the text can't be parsed at all -- callers MUST
-    treat that as "deny", never as "nothing to check". A query this module
-    cannot read is not evidence it's safe.
+    Returns ``None`` if the text can't be parsed at all -- callers MUST treat
+    that as "deny", never as "nothing to check". A query this module cannot
+    read is not evidence it's safe.
+
+    CHANGED 2026-09-30: this used to be ``extract_graph_refs`` alone, which saw
+    only ``GRAPH <iri>`` clauses, SERVICE targets and INSERT/DELETE quads. It
+    reported *no graphs at all* for ``GRAPH ?g`` (however ?g was bound),
+    FROM/FROM NAMED, WITH, USING, DROP/CLEAR/CREATE/COPY/MOVE/ADD and LOAD --
+    and an empty result is exactly what makes a caller conclude "nothing to
+    check". A live test wrote to a graph the caller had no grant on through
+    ``INSERT { GRAPH ?g ... } WHERE { VALUES ?g { <g> } }``; ``DROP GRAPH <g>``
+    parsed as referencing nothing.
     """
     from rdflib.plugins.sparql.algebra import translateQuery, translateUpdate
     from rdflib.plugins.sparql.parser import parseQuery, parseUpdate
-    from rdflib.term import URIRef
 
-    def _walk(node: object, refs: set[str], seen: set[int]) -> None:
-        if id(node) in seen:
-            return
-        seen.add(id(node))
-        name = getattr(node, "name", None)
-        if name in ("Graph", "ServiceGraphPattern"):
-            term = node.get("term") if hasattr(node, "get") else None
-            if isinstance(term, URIRef):
-                refs.add(str(term))
-        if hasattr(node, "keys") and callable(node.keys):
-            for key in node.keys():
-                value = node[key]
-                if key == "quads" and isinstance(value, dict):
-                    for graph_ref in value.keys():
-                        if isinstance(graph_ref, URIRef):
-                            refs.add(str(graph_ref))
-                    continue
-                _walk(value, refs, seen)
-        elif isinstance(node, (list, tuple)):
-            for value in node:
-                _walk(value, refs, seen)
+    def _finish(acc: _Collector) -> GraphAnalysis:
+        return GraphAnalysis(
+            refs=frozenset(acc.refs),
+            replace_refs=frozenset(acc.replace_refs),
+            dynamic=acc.dynamic,
+            default_write=acc.default_write,
+            admin_only_ops=tuple(sorted(acc.admin_ops)),
+        )
 
-    refs: set[str] = set()
     try:
         algebra = translateQuery(parseQuery(sparql_text))
-        _walk(algebra.algebra, refs, set())
-        return refs
+        acc = _Collector()
+        _collect(algebra.algebra, acc, set())
+        return _finish(acc)
     except Exception:
         pass
 
     try:
         algebra = translateUpdate(parseUpdate(sparql_text))
+        acc = _Collector()
         for request in algebra.algebra:
-            _walk(request, refs, set())
-        return refs
+            _collect(request, acc, set())
+        return _finish(acc)
     except Exception:
         pass
 
-    return _fallback_graph_refs(sparql_text)
+    fallback = _fallback_graph_refs(sparql_text)
+    return None if fallback is None else GraphAnalysis(refs=frozenset(fallback))
+
+
+def extract_graph_refs(sparql_text: str) -> set[str] | None:
+    """Every concrete graph IRI this query or update names, or ``None`` if it
+    can't be parsed (callers MUST treat that as "deny").
+
+    Kept for callers that only need the IRIs. It now reports the full set --
+    including FROM/FROM NAMED, WITH, USING and the targets of DROP/CLEAR/COPY/
+    MOVE/ADD/LOAD -- but it cannot express a graph position that is *not* a
+    fixed IRI (``GRAPH ?g``); use :func:`analyse_graph_refs` for that.
+    """
+    analysis = analyse_graph_refs(sparql_text)
+    return None if analysis is None else set(analysis.all_refs)
 
 
 # --------------------------------------------------------------------------
@@ -660,15 +787,29 @@ async def authorize_query(
     names that exact graph (``delegation.find_delegation``). Every
     referenced graph must be cleared one way or the other; a single
     uncovered graph still denies the whole query.
+
+    CHANGED 2026-09-30: a query with a graph position that is not a fixed IRI
+    (``GRAPH ?g``, ``SERVICE ?v``) is refused to non-admins -- there is nothing
+    to check the ReadGrant against, and clearing it as "references no graph"
+    let any identified caller read every graph. FROM/FROM NAMED and USING
+    targets are now checked like any other reference. Admins are unaffected.
     """
     if person is None:
         return AclDecision(False, "unresolved identity")
 
-    refs = extract_graph_refs(sparql_text)
-    if refs is None:
+    analysis = analyse_graph_refs(sparql_text)
+    if analysis is None:
         return AclDecision(False, "query could not be parsed for graph references; denied, not assumed safe", person)
 
-    for graph_iri in refs:
+    if analysis.dynamic and not await is_admin(query_fn, holons_graph, person=person):
+        return AclDecision(
+            False,
+            "query reaches graphs it does not name (GRAPH ?var, SERVICE ?var, ALL/NAMED); "
+            "name each graph explicitly, or ask an admin",
+            person,
+        )
+
+    for graph_iri in sorted(analysis.all_refs):
         if audit.is_audit_graph(graph_iri, holons_graph):
             # Not a persona graph, so it would otherwise fall through as
             # "org ground truth, always readable". Admins only.
@@ -691,6 +832,65 @@ async def authorize_query(
             return AclDecision(
                 False, f"no ReadGrant covering {graph_iri} (persona {persona})", person
             )
+    return AclDecision(True, "every referenced graph cleared", person)
+
+
+async def authorize_update(
+    query_fn: QueryFn,
+    holons_graph: str,
+    *,
+    person: str | None,
+    sparql_text: str,
+) -> AclDecision:
+    """Gate a SPARQL UPDATE by every graph it can reach, before it runs.
+
+    Writes are never role-based (see :func:`check_write`), so each concrete
+    graph the update names needs an explicit ``holon:grantsWrite``; each graph
+    hit by a *wholesale* operation (DROP, CLEAR, CREATE, COPY, MOVE, ADD) needs
+    the stricter ``holon:grantsReplace``, the same grant ``DELETE /graph`` and
+    ``/graph-op`` already require for the same reason. Then, failing closed:
+
+    - an update it cannot parse is refused;
+    - an update with a graph position that is not a fixed IRI (``GRAPH ?g``,
+      ``DROP ALL``/``NAMED``, ...) is refused to **everyone, admins included**.
+      The audit graph's protection is a per-graph check that cannot see through
+      such an update, so allowing it for admins would let ``DROP ALL`` erase the
+      log. Name each graph;
+    - writing or clearing the default graph, and ``LOAD`` (which makes the
+      store fetch a URL), are admin-only.
+    """
+    if person is None:
+        return AclDecision(False, "unresolved identity")
+
+    analysis = analyse_graph_refs(sparql_text)
+    if analysis is None:
+        return AclDecision(
+            False,
+            "update could not be parsed for graph references; denied, not assumed safe",
+            person,
+        )
+
+    if analysis.dynamic:
+        return AclDecision(
+            False,
+            "update reaches graphs it does not name (GRAPH ?var, DROP/CLEAR ALL or NAMED, ...); "
+            "name each graph explicitly",
+            person,
+        )
+
+    if analysis.default_write or analysis.admin_only_ops:
+        if not await is_admin(query_fn, holons_graph, person=person):
+            what = "LOAD" if analysis.admin_only_ops else "writing the default graph"
+            return AclDecision(False, f"{what} is admin-only", person)
+
+    for graph_iri in sorted(analysis.replace_refs):
+        decision = await check_replace(query_fn, holons_graph, person=person, target=graph_iri)
+        if not decision.allowed:
+            return AclDecision(False, f"{decision.reason} (graph: {graph_iri})", person)
+    for graph_iri in sorted(analysis.refs):
+        decision = await check_write(query_fn, holons_graph, person=person, target=graph_iri)
+        if not decision.allowed:
+            return AclDecision(False, f"{decision.reason} (graph: {graph_iri})", person)
     return AclDecision(True, "every referenced graph cleared", person)
 
 

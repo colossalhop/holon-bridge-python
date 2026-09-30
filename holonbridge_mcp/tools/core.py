@@ -169,7 +169,7 @@ async def get_holon(
     holon_iri: str,
     projection_mode: str = "immersive",
     on_behalf_of: str | None = None,
-) -> str:
+) -> str | dict:
     """Retrieve a holon as a DataBook.
 
     Projection modes: immersive, cinematic, active_inference, exploded_view.
@@ -179,6 +179,12 @@ async def get_holon(
     to you (see ``create_delegation``); the result is their view, limited to
     the graphs they delegated, and is refused otherwise. Omit it to read
     your own scope as usual.
+
+    Returns the DataBook text on success, or the bridge's error object
+    (``{"error": true, "status": ..., "detail": ...}``) on a refusal such as
+    a 403 -- hence the ``str | dict`` return type: annotated as ``str``
+    alone, a refusal failed FastMCP's output validation and surfaced as an
+    opaque validation error instead of the bridge's reason.
     """
     params: dict = {"iri": holon_iri, "projection_mode": projection_mode}
     if on_behalf_of:

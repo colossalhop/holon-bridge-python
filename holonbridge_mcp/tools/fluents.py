@@ -59,10 +59,18 @@ async def update_fluent(
     the prior value with ``get_prior_fluent_value`` and issue an ordinary
     ``Set`` with it.
 
+    Requires an identity and write access to the events, scene and sequences
+    graphs (an administrator has it implicitly). The ledger attributes every
+    transition to the person calling: ``asserted_by`` is optional and, if given,
+    must be your own IRI, or the call is refused. An administrator who needs to
+    assert as someone else uses ``act_as``. IRIs (``fluent``, and ``value`` when
+    ``is_iri`` is true) must be plain IRIs — no whitespace or any of
+    ``<>"{}|^`\\``.
+
     Returns ``oldValue``/``newValue`` (each ``{"kind": "uri"|"literal",
     "value": ...}``), the new ledger entry's ``assertion`` IRI, which entry
-    it ``superseded`` (``null`` for a fluent's first-ever transition), and
-    the minted ``sequenceId``.
+    it ``superseded`` (``null`` for a fluent's first-ever transition), the
+    minted ``sequenceId``, and ``assertedBy``.
     """
     return await _call(
         "POST",
@@ -85,6 +93,7 @@ async def get_prior_fluent_value(fluent: str) -> dict:
     Read from the ledger, not the scene graph — for building a Set-based
     revert (``update_fluent`` has no Unset primitive; see its docstring).
     Comes back error-shaped if the fluent has no prior transition (set only
-    once, or never set at all).
+    once, or never set at all). Requires an identity; ``fluent`` must be a
+    plain IRI.
     """
     return await _call("GET", f"/fluent/{fluent}/prior")

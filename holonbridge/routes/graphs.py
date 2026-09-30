@@ -34,6 +34,11 @@ the identical reason: DROP is unambiguously destructive and wholesale, the
 same shape ``drop_pipeline`` and ``check_replace`` everywhere else in this
 codebase already treat that way). Before this, ``drop_graph`` had zero ACL
 check of any kind.
+
+CHANGED 2026-09-30 (audit): ``GET /graph`` refuses the audit graph. That
+route has no identity check of its own (see the note on ``get_graph``), so
+the audit graph would otherwise be readable by anyone holding the shared
+bearer token; it is read through the admin-only ``GET /audit`` instead.
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
+from .. import audit
 from ..acl import check_replace
 from ..deps import AnimusDep, ClientDep, ConnDep, SettingsDep
 from ..fuseki import FusekiError
@@ -100,6 +106,10 @@ async def list_graphs(
 
 @router.get("/graph", response_class=PlainTextResponse)
 async def get_graph(conn: ConnDep, client: ClientDep, iri: str = Query(...)) -> str:
+    if audit.is_audit_graph(iri, conn.holons_graph):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, detail="the audit graph is read through GET /audit"
+        )
     try:
         return await client.get_graph(conn, iri)
     except FusekiError as exc:

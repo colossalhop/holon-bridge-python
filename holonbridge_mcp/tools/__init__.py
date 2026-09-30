@@ -25,6 +25,7 @@ mirror.
 from __future__ import annotations
 
 from . import (
+    audit,
     banks,
     candidates,
     core,
@@ -46,6 +47,7 @@ from . import (
 )
 
 __all__ = [
+    "audit",
     "banks",
     "candidates",
     "core",

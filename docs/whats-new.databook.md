@@ -2,7 +2,7 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.3
+version: 1.0.4
 created: 2026-09-27
 updated: 2026-09-30
 author:
@@ -48,6 +48,25 @@ process:
 
 ### 2026-09-30
 
+- **Audit: who may turn it down, and how.** A live test showed an admin could
+  silence the log with one plain SPARQL update to the `meta` graph, and that
+  update went unrecorded. The setting now lives in a bridge-owned graph,
+  `urn:{dataset}:audit:config`, protected exactly like the audit graph:
+  nobody can write it through the API, admin included, so the audited
+  `/audit/*` routes are the only way to change it. `POST /audit/level` has a
+  floor of `mutations` (accepts `mutations`, `standard`, or `default` to clear
+  the override); `off` and `denials` are refused. Going lower is either a
+  **time-boxed suspension** (`POST /audit/suspend`, reason mandatory, at most
+  240 minutes, reverts on its own, start and end both recorded;
+  `POST /audit/resume` ends it early) or a **permanent operator decision** in
+  the bridge's environment (`HOLONBRIDGE_AUDIT_LEVEL`, and new
+  `HOLONBRIDGE_AUDIT_LEVELS=dataset=level,...`). New MCP tools `suspend_audit`
+  and `resume_audit`. **Behaviour change:** `set_audit_level('off')` now
+  returns a 400, and `GET /audit/level` returns `effective`, `api_level`,
+  `operator_level` and `suspension`. Also fixed: `GET /audit` never returned
+  `hb:reason`, so refusal reasons and change notes were stored but invisible;
+  it now returns them as `note`.
+  [PR #33](https://github.com/kurtcagle/holon-bridge-python/pull/33)
 - **Security fix: `GET /graph?iri=` now requires an identity and applies the
   `/sparql/select` read rules.** It previously had no identity check at all,
   so anyone holding the shared bearer token could read any graph in full --
@@ -230,4 +249,10 @@ hb:release-2026-09-30-e a hb:ReleaseNote ;
     rdfs:label "GET /graph requires an identity and applies the /sparql/select read rules" ;
     dcterms:description "GET /graph?iri= previously had no identity check, so anyone with the shared bearer token could read any graph in full. It now depends on AnimusDep and runs acl.authorize_query on a probe for that one graph: a persona graph needs a ReadGrant, an admin bypass or a read delegation, the audit graph is admin-only, and ground truth is readable by any identified caller. Callers sending only the bearer token now get a 401. Supersedes the audit-graph-only refusal from PR 31." ;
     rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/32> .
+
+hb:release-2026-09-30-f a hb:ReleaseNote ;
+    dcterms:date "2026-09-30"^^xsd:date ;
+    rdfs:label "Audit: bridge-owned config, an API floor, time-boxed suspensions, operator levels" ;
+    dcterms:description "The audit setting moved from the admin-writable meta graph to urn:{dataset}:audit:config, protected like the audit graph. POST /audit/level accepts only mutations, standard or default; off and denials are either a time-boxed POST /audit/suspend (mandatory reason, at most 240 minutes, self-reverting, start and end recorded) or an operator decision via HOLONBRIDGE_AUDIT_LEVEL / HOLONBRIDGE_AUDIT_LEVELS. Also fixed GET /audit omitting hb:reason. set_audit_level('off') now returns a 400." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/33> .
 ```

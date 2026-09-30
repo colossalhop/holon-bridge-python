@@ -74,10 +74,12 @@ Home here": an ordinary, expected outcome, not an error.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
+from .. import delegation as dg
 from ..acl import is_admin
 from ..conn import Conn
 from ..deps import ActingAsDep, AnimusDep, ClientDep, ConnDep
@@ -797,6 +799,17 @@ async def deactivate_person(
     grants rather than resolved identity. The Person, their label, and
     their external identity all survive.
 
+    CHANGED 2026-09-30: every still-live ``holon:Delegation`` this Person
+    gave or received is revoked in that same request (stamped
+    ``holon:revokedAt``, records retained), and the ids are returned as
+    ``delegations_revoked``. ``delegation.find_delegation`` already
+    ignores an inactive delegator's delegations and an inactive delegate
+    cannot authenticate, so this too is belt-and-suspenders -- but it is
+    what makes ``list_delegations`` tell the truth ("revoked", not
+    "active" for someone locked out) and what stops a later
+    ``reactivate_person`` from silently reviving delegations nobody
+    re-approved.
+
     Two things this refuses to do, on purpose:
 
     - Deactivate the caller's own real identity (``animus.real_person``)
@@ -837,6 +850,15 @@ async def deactivate_person(
 
     write_grants = await _person_write_grants(query_fn, conn, person=person_iri)
 
+    try:
+        live_delegations = [
+            d["delegation"]
+            for d in await dg.list_delegations(query_fn, conn.holons_graph, person=person_iri)
+            if d["status"] in ("active", "not_yet_valid")
+        ]
+    except dg.DelegationError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
     statements = [
         f"DELETE DATA {{ GRAPH <{conn.holons_graph}> "
         f"{{ <{person_iri}> holon:hasRole <{r['role']}> . }} }}"
@@ -847,6 +869,9 @@ async def deactivate_person(
         f"{{ <{g['target']}> holon:{_GRANT_PREDICATE[g['mode']]} <{person_iri}> . }} }}"
         for g in write_grants
     ]
+    statements.append(
+        dg.revoke_all_update(conn.holons_graph, person_iri, datetime.now(timezone.utc))
+    )
     statements.append(
         f"INSERT DATA {{ GRAPH <{conn.holons_graph}> "
         f'{{ <{person_iri}> holon:status "inactive" . }} }}'
@@ -864,6 +889,7 @@ async def deactivate_person(
         "deactivated": True,
         "roles_revoked": sorted(role_iris),
         "write_grants_revoked": write_grants,
+        "delegations_revoked": live_delegations,
     }
 
 

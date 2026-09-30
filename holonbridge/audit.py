@@ -40,11 +40,27 @@ after the handler, so it cannot make the *data* write conditional on the
 *audit* write. Failing closed for identity/delegation/admin changes would
 need an intent entry written before the operation; that is not built.
 
-Levels, per dataset (``off`` < ``denials`` < ``mutations`` < ``standard``),
-set with ``POST /audit/level`` (stored in the dataset's ``meta`` graph,
-cached for :data:`_CONFIG_TTL` seconds) or, as the process default, the
-``HOLONBRIDGE_AUDIT_LEVEL`` environment variable. The default is
-``standard``.
+Who may turn it down, and how (CHANGED 2026-09-30 after a live test showed
+the first design let an admin silence the log with one SPARQL update):
+
+- The audit *configuration* lives in its own graph, ``urn:{dataset}:audit:config``,
+  which gets the same protection as the audit graph itself: nobody can write
+  it through the API, admin included, so the only way to change it is the
+  audited routes (``POST /audit/level``, ``/audit/suspend``, ``/audit/resume``).
+  Before this it was a triple in the ``meta`` graph, which admins can write;
+  that triple is now ignored.
+- The API has a **floor**: ``POST /audit/level`` accepts only ``mutations``,
+  ``standard`` or ``default`` (clear the override). Anything quieter --
+  ``denials`` or ``off`` -- is either a **time-boxed suspension**
+  (``POST /audit/suspend``: a reason is mandatory, the maximum is
+  :data:`MAX_SUSPEND_MINUTES`, it reverts on its own, and both its start and
+  its end are recorded) or a **permanent operator decision** made outside the
+  API, in the bridge's environment: ``HOLONBRIDGE_AUDIT_LEVEL`` (all
+  datasets) and ``HOLONBRIDGE_AUDIT_LEVELS`` (``dataset=level,...``).
+- Effective level = an active suspension, else the API-set level, else the
+  operator's level. The default is ``standard``.
+- Every change made through the API is recorded whatever level it sets, so
+  turning audit down never erases the record of doing so.
 """
 
 from __future__ import annotations
@@ -57,7 +73,8 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -74,7 +91,17 @@ XSD = "http://www.w3.org/2001/XMLSchema#"
 LEVELS: tuple[str, ...] = ("off", "denials", "mutations", "standard")
 DEFAULT_LEVEL = "standard"
 
-#: How long a dataset's configured level is cached, in seconds.
+#: What ``POST /audit/level`` may set permanently. Anything quieter is a
+#: time-boxed suspension or an operator decision.
+API_LEVELS: tuple[str, ...] = ("mutations", "standard")
+
+#: What ``POST /audit/suspend`` may suspend audit down to.
+SUSPENDABLE: tuple[str, ...] = ("denials", "off")
+
+#: Longest single suspension, in minutes.
+MAX_SUSPEND_MINUTES = 240
+
+#: How long a dataset's stored configuration is cached, in seconds.
 _CONFIG_TTL = 30.0
 
 #: POST routes that only read, and so are not mutations.
@@ -82,7 +109,7 @@ READ_ONLY_POSTS: frozenset[str] = frozenset(
     {"/sparql/select", "/sparql/construct", "/validate"}
 )
 
-#: Never recorded (unless denied): the audit reader itself, and liveness.
+#: Never recorded (unless denied or a mutation): the audit reader, liveness.
 _UNRECORDED_PREFIXES: tuple[str, ...] = ("/audit", "/health")
 
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -107,14 +134,19 @@ def audit_graph(holons_graph: str) -> str:
     return _swap(holons_graph, ":audit")
 
 
-def config_iri(holons_graph: str) -> str:
-    """The resource whose ``hb:auditLevel`` in the ``meta`` graph configures
-    this dataset."""
+def config_graph(holons_graph: str) -> str:
+    """The graph holding this dataset's audit configuration. Its IRI is also
+    the IRI of the configuration resource inside it."""
     return _swap(holons_graph, ":audit:config")
 
 
+config_iri = config_graph  # the configuration resource shares its graph's IRI
+
+
 def is_audit_graph(target: str, holons_graph: str) -> bool:
-    return target == audit_graph(holons_graph)
+    """Whether ``target`` is one of the two graphs only the bridge may write
+    and only admins may read: the audit log and its configuration."""
+    return target in (audit_graph(holons_graph), config_graph(holons_graph))
 
 
 # --------------------------------------------------------------------------
@@ -159,60 +191,266 @@ def foreign_user_graphs(graph_refs: Iterable[str], caller_slug: str) -> list[str
 
 
 # --------------------------------------------------------------------------
-# Levels
+# Levels: operator, API and suspension
 # --------------------------------------------------------------------------
 
 def default_level() -> str:
+    """The process-wide operator default, ``HOLONBRIDGE_AUDIT_LEVEL``."""
     value = os.environ.get("HOLONBRIDGE_AUDIT_LEVEL", DEFAULT_LEVEL).strip().lower()
     return value if value in LEVELS else DEFAULT_LEVEL
 
 
-_level_cache: dict[tuple[str, str], tuple[float, str]] = {}
+def operator_level(dataset: str) -> str:
+    """The level the operator has decided for ``dataset``:
+    ``HOLONBRIDGE_AUDIT_LEVELS`` (``dataset=level,other=level``) if it names
+    the dataset, else :func:`default_level`. Set in the bridge's environment,
+    so changing it takes host access and a restart -- not an API call. This
+    is the only way to make ``denials`` or ``off`` permanent."""
+    for part in os.environ.get("HOLONBRIDGE_AUDIT_LEVELS", "").split(","):
+        name, _, level = part.partition("=")
+        if name.strip() == dataset and level.strip().lower() in LEVELS:
+            return level.strip().lower()
+    return default_level()
+
+
+@dataclass(frozen=True)
+class Config:
+    """A dataset's stored audit configuration, from its config graph."""
+
+    api_level: str | None = None
+    suspended_to: str | None = None
+    suspended_until: datetime | None = None
+    suspended_reason: str | None = None
+    suspended_by: str | None = None
+
+    def suspension_active(self, now: datetime) -> bool:
+        return bool(
+            self.suspended_to in LEVELS and self.suspended_until and now < self.suspended_until
+        )
+
+
+def _parse_dt(value: str) -> datetime | None:
+    """Tolerant xsd:dateTime parse (older Pythons reject a trailing ``Z``)."""
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            parsed = datetime.fromisoformat(re.sub(r"\.\d+", "", text))
+        except ValueError:
+            return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+_config_cache: dict[tuple[str, str], tuple[float, Config]] = {}
+_level_cache = _config_cache  # the name the tests and older callers know
 
 
 def forget_level(conn) -> None:
-    _level_cache.pop((conn.bank_name, conn.dataset), None)
+    _config_cache.pop((conn.bank_name, conn.dataset), None)
 
 
-async def level_for(client, conn) -> str:
-    """The audit level for ``conn``'s dataset: its ``hb:auditLevel`` in the
-    ``meta`` graph if set, else the process default. Cached briefly; any
-    failure to read it falls back to the default rather than raising."""
+async def _config(client, conn, *, fresh: bool = False) -> Config:
+    """The stored configuration, cached briefly. Any failure to read it
+    yields an empty :class:`Config` (so the operator's level applies) rather
+    than raising."""
     key = (conn.bank_name, conn.dataset)
-    hit = _level_cache.get(key)
+    hit = _config_cache.get(key)
     now = time.monotonic()
-    if hit and now - hit[0] < _CONFIG_TTL:
+    if not fresh and hit and now - hit[0] < _CONFIG_TTL:
         return hit[1]
 
-    level = default_level()
+    cfg = Config()
+    graph = config_graph(conn.holons_graph)
     try:
         result = await client.select(
             conn,
             f"""PREFIX hb: <{HB}>
-SELECT ?l WHERE {{ GRAPH <{conn.graph("meta")}> {{ <{config_iri(conn.holons_graph)}> hb:auditLevel ?l }} }} LIMIT 1""",
+SELECT ?level ?to ?until ?reason ?by WHERE {{ GRAPH <{graph}> {{
+  OPTIONAL {{ <{graph}> hb:auditLevel ?level }}
+  OPTIONAL {{ <{graph}> hb:suspendedTo ?to ; hb:suspendedUntil ?until }}
+  OPTIONAL {{ <{graph}> hb:suspendedReason ?reason }}
+  OPTIONAL {{ <{graph}> hb:suspendedBy ?by }}
+}} }} LIMIT 1""",
         )
         rows = result.get("results", {}).get("bindings", [])
-        if rows and rows[0]["l"]["value"] in LEVELS:
-            level = rows[0]["l"]["value"]
+        if rows:
+            row = rows[0]
+            level = row.get("level", {}).get("value")
+            cfg = Config(
+                api_level=level if level in LEVELS else None,
+                suspended_to=row.get("to", {}).get("value"),
+                suspended_until=(
+                    _parse_dt(row["until"]["value"]) if "until" in row else None
+                ),
+                suspended_reason=row.get("reason", {}).get("value"),
+                suspended_by=row.get("by", {}).get("value"),
+            )
     except Exception as exc:  # noqa: BLE001 - never let config lookup break a request
-        logger.warning("audit: could not read level for %s: %s", conn.dataset, exc)
-    _level_cache[key] = (now, level)
-    return level
+        logger.warning("audit: could not read configuration for %s: %s", conn.dataset, exc)
+    _config_cache[key] = (now, cfg)
+    return cfg
+
+
+_end_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+async def _end_expired_suspension(client, conn) -> None:
+    """Record that a suspension ran out, and clear it. Called by whichever
+    request first notices the expiry, so the "resumed" entry is stamped when
+    it was noticed, not at the scheduled end (there may be no traffic in
+    between); its reason states the scheduled end. The lock and re-read stop
+    concurrent requests in this process writing it twice; separate
+    processes could still, rarely, each write one."""
+    key = (conn.bank_name, conn.dataset)
+    async with _end_locks.setdefault(key, asyncio.Lock()):
+        cfg = await _config(client, conn, fresh=True)
+        now = datetime.now(timezone.utc)
+        if not cfg.suspended_to or not cfg.suspended_until or now < cfg.suspended_until:
+            return
+        await record(
+            client,
+            conn,
+            {
+                "at": now,
+                "outcome": "allowed",
+                "operation": "audit.resumed",
+                "method": "SYSTEM",
+                "path": "/audit/suspend",
+                "status": 200,
+                "actor": cfg.suspended_by,
+                "reason": (
+                    f"audit suspension to {cfg.suspended_to} ended at expiry "
+                    f"({dg._iso(cfg.suspended_until)})"
+                ),
+            },
+        )
+        await _clear_suspension(client, conn)
+
+
+async def level_for(client, conn) -> str:
+    """The effective audit level for ``conn``'s dataset: an active
+    suspension, else the API-set level, else the operator's."""
+    cfg = await _config(client, conn)
+    now = datetime.now(timezone.utc)
+    if cfg.suspended_to and cfg.suspended_until and now >= cfg.suspended_until:
+        await _end_expired_suspension(client, conn)
+        cfg = await _config(client, conn, fresh=True)
+    if cfg.suspension_active(now):
+        return cfg.suspended_to  # type: ignore[return-value]
+    return cfg.api_level or operator_level(conn.dataset)
+
+
+async def describe(client, conn) -> dict[str, Any]:
+    """Everything an admin needs to see about the current setting."""
+    forget_level(conn)
+    effective = await level_for(client, conn)
+    cfg = await _config(client, conn, fresh=True)
+    now = datetime.now(timezone.utc)
+    suspension = None
+    if cfg.suspension_active(now):
+        suspension = {
+            "level": cfg.suspended_to,
+            "until": dg._iso(cfg.suspended_until),  # type: ignore[arg-type]
+            "reason": cfg.suspended_reason,
+            "by": cfg.suspended_by,
+        }
+    return {
+        "effective": effective,
+        "api_level": cfg.api_level,
+        "operator_level": operator_level(conn.dataset),
+        "suspension": suspension,
+        "levels": list(LEVELS),
+        "api_settable": list(API_LEVELS) + ["default"],
+        "suspendable": list(SUSPENDABLE),
+        "max_suspend_minutes": MAX_SUSPEND_MINUTES,
+    }
+
+
+_SUSPENSION_PREDICATES = ("suspendedTo", "suspendedUntil", "suspendedReason", "suspendedBy")
+
+
+def _delete_suspension_sql(graph: str) -> str:
+    return " ;\n".join(
+        f"DELETE WHERE {{ GRAPH <{graph}> {{ <{graph}> hb:{p} ?o }} }}"
+        for p in _SUSPENSION_PREDICATES
+    )
+
+
+async def _clear_suspension(client, conn) -> None:
+    graph = config_graph(conn.holons_graph)
+    await client.update(conn, f"PREFIX hb: <{HB}>\n{_delete_suspension_sql(graph)}")
+    forget_level(conn)
 
 
 async def set_level(client, conn, level: str) -> None:
-    """Persist ``level`` for this dataset. Raises ``ValueError`` if it is not
-    one of :data:`LEVELS`. One atomic request."""
-    if level not in LEVELS:
-        raise ValueError(f"level must be one of {list(LEVELS)}")
-    cfg, meta = config_iri(conn.holons_graph), conn.graph("meta")
+    """Set the API-level override: ``mutations`` or ``standard`` (the API
+    floor), or ``default`` to clear it and fall back to the operator's level.
+    Raises ``ValueError`` for anything else, ``denials`` and ``off``
+    included -- see the module docstring."""
+    graph = config_graph(conn.holons_graph)
+    if level == "default":
+        await client.update(
+            conn,
+            f"PREFIX hb: <{HB}>\nDELETE WHERE {{ GRAPH <{graph}> {{ <{graph}> hb:auditLevel ?o }} }}",
+        )
+    elif level in API_LEVELS:
+        await client.update(
+            conn,
+            f"""PREFIX hb: <{HB}>
+DELETE WHERE {{ GRAPH <{graph}> {{ <{graph}> hb:auditLevel ?o }} }} ;
+INSERT DATA {{ GRAPH <{graph}> {{ <{graph}> hb:auditLevel {dg._literal(level)} }} }}""",
+        )
+    else:
+        raise ValueError(
+            f"only {list(API_LEVELS)} or 'default' can be set permanently through the API; "
+            "use POST /audit/suspend for a time-boxed 'denials' or 'off', or set "
+            "HOLONBRIDGE_AUDIT_LEVEL / HOLONBRIDGE_AUDIT_LEVELS in the bridge's environment"
+        )
+    forget_level(conn)
+
+
+async def suspend(
+    client, conn, *, level: str, minutes: int, reason: str, by: str | None
+) -> datetime:
+    """Suspend auditing down to ``level`` for ``minutes``. A reason is
+    mandatory. Replaces any suspension already running. Returns the moment
+    it lapses. Raises ``ValueError`` on bad input."""
+    if level not in SUSPENDABLE:
+        raise ValueError(f"a suspension may only lower audit to one of {list(SUSPENDABLE)}")
+    if not 1 <= minutes <= MAX_SUSPEND_MINUTES:
+        raise ValueError(f"minutes must be between 1 and {MAX_SUSPEND_MINUTES}")
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError("a reason is required to suspend auditing")
+    until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    graph = config_graph(conn.holons_graph)
+    actor = _iri(by)
+    by_triple = f"<{graph}> hb:suspendedBy <{actor}> ." if actor else ""
     await client.update(
         conn,
         f"""PREFIX hb: <{HB}>
-DELETE WHERE {{ GRAPH <{meta}> {{ <{cfg}> hb:auditLevel ?old }} }} ;
-INSERT DATA {{ GRAPH <{meta}> {{ <{cfg}> hb:auditLevel {dg._literal(level)} }} }}""",
+PREFIX xsd: <{XSD}>
+{_delete_suspension_sql(graph)} ;
+INSERT DATA {{ GRAPH <{graph}> {{
+  <{graph}> hb:suspendedTo {dg._literal(level)} ;
+            hb:suspendedUntil "{_iso_micro(until)}"^^xsd:dateTime ;
+            hb:suspendedReason {dg._literal(reason[:200])} .
+  {by_triple}
+}} }}""",
     )
     forget_level(conn)
+    return until
+
+
+async def resume(client, conn) -> Config | None:
+    """End a running suspension early. Returns what it was, or ``None`` if
+    none was running."""
+    cfg = await _config(client, conn, fresh=True)
+    if not cfg.suspended_to:
+        return None
+    await _clear_suspension(client, conn)
+    return cfg
 
 
 # --------------------------------------------------------------------------

@@ -31,6 +31,7 @@ HOLON = "https://w3id.org/holon/"
 HB = Namespace(audit.HB)
 HOLONS = "urn:example:holons"
 AUDIT = "urn:example:audit"
+CONFIG = "urn:example:audit:config"
 META = "urn:example:meta"
 ADMIN = "urn:example:person:root"
 KURT = "urn:example:person:kurt"
@@ -184,6 +185,16 @@ def client(stub, conn, actor):
         raise RuntimeError("kaboom")
 
     return TestClient(app, raise_server_exceptions=False)
+
+
+def force_level(stub, level):
+    """Write a level straight into the config graph, the way an operator with
+    access to the store could. The API cannot set 'off' or 'denials'
+    permanently -- that is the point -- so tests that need them do it here."""
+    stub.ds.update(
+        f'INSERT DATA {{ GRAPH <{CONFIG}> {{ <{CONFIG}> <{audit.HB}auditLevel> "{level}" }} }}'
+    )
+    audit._level_cache.clear()
 
 
 def push(client, graph=KURT_HOLONS, mode="merge", turtle=TURTLE):
@@ -357,14 +368,14 @@ def test_requests_that_never_reached_a_dataset_are_skipped(stub, client):
 
 
 def test_level_off_records_nothing(stub, client, actor):
-    asyncio.run(audit.set_level(stub, Conn("u", "example", False, "local"), "off"))
+    force_level(stub, "off")
     actor.update(person=JANE, real=JANE)
     push(client)  # a denial, which would otherwise be recorded
     assert entries(stub) == []
 
 
 def test_level_denials_records_only_refusals(stub, client, actor):
-    asyncio.run(audit.set_level(stub, Conn("u", "example", False, "local"), "denials"))
+    force_level(stub, "denials")
     push(client)  # an allowed admin write
     assert entries(stub) == []
     actor.update(person=JANE, real=JANE)
@@ -462,18 +473,21 @@ def test_a_refused_attempt_to_read_the_log_is_logged(stub, client, actor):
 
 
 def test_setting_the_level_works_and_is_always_recorded(stub, client):
-    assert client.get("/audit/level").json()["level"] == "standard"
-    response = client.post("/audit/level", json={"level": "off"})
-    assert response.status_code == 200 and response.json()["level"] == "off"
-    assert client.get("/audit/level").json()["level"] == "off"
+    assert client.get("/audit/level").json()["effective"] == "standard"
+    response = client.post("/audit/level", json={"level": "mutations"})
+    assert response.status_code == 200 and response.json()["effective"] == "mutations"
+    assert client.get("/audit/level").json()["effective"] == "mutations"
 
-    # ...and the change that turned audit off is itself on the record.
+    # ...and the change itself is on the record.
     (e,) = entries(stub)
     assert e["operation"] == "POST /audit/level"
-    assert e["note"] == "audit level standard -> off"
+    assert e["note"] == "audit level standard -> mutations"
 
-    push(client)  # now off: nothing further is recorded
-    assert len(entries(stub)) == 1
+    # 'mutations' still records writes, but no longer records security reads.
+    push(client)
+    assert len(entries(stub)) == 2
+    client.get("/holon", params={"on_behalf_of": "kurt"})
+    assert len(entries(stub)) == 2
 
 
 def test_an_invalid_level_is_rejected(client):

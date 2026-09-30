@@ -2,7 +2,7 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.7
+version: 1.0.8
 created: 2026-09-27
 updated: 2026-09-30
 author:
@@ -48,6 +48,23 @@ process:
 
 ### 2026-09-30
 
+- **Fluent updates: a lost race no longer leaves an orphan ledger entry.**
+  `update_fluent` runs a ledger append and a scene update in one request. The
+  scene update was a compare-and-set, but the ledger append beside it was an
+  unconditional `INSERT DATA`: when two transitions on one fluent read the same
+  current value, the loser's scene update correctly did nothing while its
+  ledger entry still landed, leaving the fluent with two live
+  `StateAssertion`s -- the condition `holon:StateAssertionNonOverlapShape`
+  exists to forbid. The ledger append now carries the same `WHERE` guard as the
+  scene update, so a loser writes neither half and retries as before, and the
+  pre-commit trial is confined to its scratch copies. The tests run the real
+  `update_fluent` against a real SPARQL engine (rdflib, not Jena): 5 of 9 fail
+  on the old code and all pass now. **This does not repair existing data**; the
+  PR carries a query for finding fluents that already have more than one live
+  assertion. Two adjacent problems were found and deliberately left alone:
+  list-mode operations can never confirm (8 ledger entries, then an error), and
+  a possible double application under three-way interleaving.
+  [PR #41](https://github.com/kurtcagle/holon-bridge-python/pull/41)
 - **SHACL: a second, ontology-aware shapes graph.** Jena validates one flat
   graph, so a shape that needs the ontology visible -- a constraint over a
   property *classified* there, or a `sh:class` check against a class declared
@@ -327,4 +344,10 @@ hb:release-2026-09-30-i a hb:ReleaseNote ;
     rdfs:label "SHACL: a second, ontology-aware shapes graph (context pack)" ;
     dcterms:description "A dataset may keep urn:{dataset}:shacl-context (new graph role shacl-context), validated against the target merged with the dataset's ontology in a scratch copy, because Jena's SHACL service validates one flat graph and a shape that needs the ontology visible is otherwise vacuous or wrong. Writes naming no shapes_graph run both packs and either can return a 422, each result tagged with its pack; context is added after any reduction rule and, in delta mode, to the baseline as well so the ontology's own violations are not blamed on the payload. POST /validate and MCP validate_turtle gain context and merge_context. No context shapes graph means unchanged behaviour. Not fixed here: POST /validate has no identity check." ;
     rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/40> .
+
+hb:release-2026-09-30-j a hb:ReleaseNote ;
+    dcterms:date "2026-09-30"^^xsd:date ;
+    rdfs:label "Fluent updates: a lost race no longer leaves an orphan ledger entry" ;
+    dcterms:description "update_fluent ran a compare-and-set scene update beside an unconditional INSERT DATA ledger append in one request, so when two transitions on a fluent read the same current value the loser's scene update correctly no-opped while its ledger entry still landed, leaving two live StateAssertions. The ledger append now carries the same WHERE guard as the scene update, so a loser writes neither half and retries as before, and the pre-commit trial substitutes the scene graph IRI in the ledger statement as well. Tested against a real SPARQL engine (rdflib, not Jena): 5 of 9 new tests fail on the old code. Does not repair existing orphans; the PR has a detection query. Left alone: list-mode operations cannot confirm (8 ledger entries, then an error), and a possible double application under three-way interleaving." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/41> .
 ```

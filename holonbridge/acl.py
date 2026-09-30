@@ -914,7 +914,7 @@ def team_visibility_filter(teams: frozenset[str], *, subject_var: str = "?s") ->
     """A FILTER fragment to inject into any query reading a graph that may
     carry holon:visibleToTeam. Excludes a subject only if it HAS a team
     restriction and none of the caller's teams satisfy it; a subject with no
-    restriction at all is absent from the DataBook, matching "absence means
+    restriction at all is always included, matching "absence means
     unscoped" in the DataBook.
     """
     if not teams:

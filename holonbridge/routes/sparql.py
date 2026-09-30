@@ -27,6 +27,15 @@ refusal to ``holonbridge.audit.annotate``. A read of *another person's*
 private persona graph -- whether allowed by a delegation, an admin bypass
 or a persona-wide ReadGrant -- is flagged as a security read, so it is
 recorded at the ``standard`` audit level.
+
+CHANGED 2026-09-30 (graph-reference hardening): update authorisation moved
+into ``acl.authorize_update`` and the graph analysis behind both checks was
+rewritten. The old check saw only ``GRAPH <iri>`` and INSERT/DELETE quads, so
+an update or query reached "references no graph" -- and was allowed -- through
+``GRAPH ?g`` (however ``?g`` was bound), FROM/FROM NAMED, WITH, USING, and
+DROP/CLEAR/CREATE/COPY/MOVE/ADD/LOAD. A live test wrote to a graph with no
+grant on it through ``INSERT { GRAPH ?g ... } WHERE { VALUES ?g { <g> } }``.
+See ``acl.analyse_graph_refs`` and ``acl.authorize_update`` for the rules.
 """
 
 from __future__ import annotations
@@ -36,7 +45,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from .. import audit
-from ..acl import authorize_query, check_write, extract_graph_refs
+from ..acl import analyse_graph_refs, authorize_query, authorize_update
 from ..deps import AnimusDep, ClientDep, ConnDep
 from ..fuseki import FusekiError
 from ..sparql_kind import classify
@@ -83,7 +92,8 @@ async def _authorize_read(text: str, conn: ConnDep, client: ClientDep, animus: A
         sparql_text=text,
         persona_of_graph=conn.persona_for_graph,
     )
-    refs = extract_graph_refs(text) or set()
+    analysis = analyse_graph_refs(text)
+    refs = analysis.all_refs if analysis else frozenset()
     audit.annotate(graphs=sorted(refs))
     if not decision.allowed:
         audit.annotate(reason=decision.reason)
@@ -98,28 +108,19 @@ async def _authorize_write(text: str, conn: ConnDep, client: ClientDep, animus: 
     if animus.person is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="unresolved identity")
 
-    refs = extract_graph_refs(text)
-    if refs is None:
-        audit.annotate(reason="update could not be parsed for graph references")
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            detail="update could not be parsed for graph references; denied, not assumed safe",
-        )
-    audit.annotate(graphs=sorted(refs))
+    analysis = analyse_graph_refs(text)
+    if analysis is not None:
+        audit.annotate(graphs=sorted(analysis.all_refs))
 
     async def query_fn(q: str) -> dict:
         return await client.select(conn, q)
 
-    for graph_iri in refs:
-        decision = await check_write(
-            query_fn, conn.holons_graph, person=animus.person, target=graph_iri
-        )
-        if not decision.allowed:
-            audit.annotate(reason=f"{decision.reason} (graph: {graph_iri})")
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                detail=f"{decision.reason} (graph: {graph_iri})",
-            )
+    decision = await authorize_update(
+        query_fn, conn.holons_graph, person=animus.person, sparql_text=text
+    )
+    if not decision.allowed:
+        audit.annotate(reason=decision.reason)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=decision.reason)
 
 
 @router.post("/select")

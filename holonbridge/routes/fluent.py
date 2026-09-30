@@ -29,6 +29,14 @@ IRI-valued ``value`` into SPARQL unescaped.
 
 The audit middleware records a fluent update like any mutation; the graphs,
 authority and a payload digest are attached here.
+
+CHANGED 2026-09-30 (sequence contention): ``sequence.mint`` raises
+``SequenceError`` when it runs out of retries under contention, and this route
+did not catch it, so a caller who lost that many races got a bare 500 with no
+explanation. ``POST /sequence/mint`` has always mapped the same error to a 409.
+This route now does too, with the same ``error``/``message`` body the other
+fluent refusals use. Nothing of the transition was written (an attempt that
+loses writes neither half of it), so the caller can simply retry.
 """
 
 from __future__ import annotations
@@ -45,6 +53,7 @@ from ..acl import check_write
 from ..deps import AnimusDep, ClientDep, ConnDep
 from ..fluent import FluentError, FluentUpdateResult, Operation, prior_value, update_fluent
 from ..fuseki import FusekiError
+from ..sequence import SequenceError
 
 router = APIRouter(prefix="/fluent", tags=["fluent"])
 
@@ -145,6 +154,11 @@ async def update(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={"error": "fluent_error", "message": str(exc)},
+        ) from exc
+    except SequenceError as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"error": "sequence_contention", "message": str(exc)},
         ) from exc
     except FusekiError as exc:
         raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc

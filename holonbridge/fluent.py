@@ -117,6 +117,26 @@ confirmation read-back below retries it exactly as before.
 ``_precommit_check`` now substitutes the scene graph IRI in the ledger
 statement as well, since that statement now reads the scene graph. Only the
 guard is shared; nothing else about the two statements changed.
+
+CHANGED 2026-09-30 (confirmation): a transition is now confirmed by finding its
+OWN ledger entry, not by comparing the scene graph's current assertion with its
+own. The old test was wrong in three ways that the ledger guard above made
+visible. (1) List-mode fluents never have ``holon:currentAssertion``, so the
+comparison could not succeed: every ListInsert/ListRemove wrote its member,
+failed to confirm, and looped to the attempt limit -- one ledger entry per
+attempt -- before raising. (2) A third writer landing between this
+transition's commit and its read-back made a WINNER believe it had lost; it
+retried from a fresh read and applied its operation a second time, so an
+Insert delta counted twice. (3) ``newValue`` was whatever the scene graph held
+at read-back, which in that case is someone else's value.
+
+Since the ledger append shares the scene update's guard and transaction, its
+entry exists exactly when the transition fired; being append-only, nothing can
+remove it afterwards. Its presence is therefore a sound confirmation for every
+mode whatever happens next, and its ``hevt:hasValue`` is this transition's own
+value. A ListRemove of a value that is not a member is now refused up front,
+before an id is minted: its guard can never match, so it would otherwise
+retry to the attempt limit and report contention that does not exist.
 """
 
 from __future__ import annotations
@@ -368,6 +388,42 @@ WHERE {{
         await client.drop_graph(conn, scratch_scene)
 
 
+async def _confirm_own_assertion(
+    client: FusekiClient, conn: Conn, *, events_graph: str, assertion_iri: str
+) -> TypedValue | None:
+    """This transition's own value as recorded in the ledger, or ``None`` if its
+    ledger entry does not exist -- i.e. the guarded update did not fire and
+    this attempt lost. See the module docstring's 2026-09-30 (confirmation)
+    note for why the ledger, and not the scene graph, is what is asked."""
+    query = f"""{_PREFIXES}
+SELECT ?value WHERE {{
+  GRAPH <{events_graph}> {{
+    <{assertion_iri}> a hevt:StateAssertion ;
+                      hevt:hasValue ?value .
+  }}
+}} LIMIT 1"""
+    results = await client.select(conn, query)
+    bindings = results.get("results", {}).get("bindings", [])
+    if not bindings:
+        return None
+    return TypedValue.from_binding(bindings[0]["value"])
+
+
+async def _is_list_member(
+    client: FusekiClient, conn: Conn, *, fluent: str, value: Any, is_iri: bool
+) -> bool:
+    member_term = _render_input(value, is_iri=is_iri)
+    query = f"""{_PREFIXES}
+SELECT ?item WHERE {{
+  GRAPH <{conn.scene_graph}> {{
+    <{fluent}> holon:hasListItem ?item .
+    FILTER (?item = {member_term})
+  }}
+}} LIMIT 1"""
+    results = await client.select(conn, query)
+    return bool(results.get("results", {}).get("bindings", []))
+
+
 async def _evaluate_state_triggers(client: FusekiClient, conn: Conn, *, fluent: str) -> None:
     """Fire every Active StateTrigger after a successful, confirmed
     transition. Never allowed to affect the transition itself -- see the
@@ -422,6 +478,13 @@ async def update_fluent(
 
     for _ in range(attempts):
         current, current_assertion = await _read_current(client, conn, fluent=fluent)
+
+        if operation is Operation.LIST_REMOVE and not await _is_list_member(
+            client, conn, fluent=fluent, value=value, is_iri=is_iri
+        ):
+            raise FluentError(
+                f"<{fluent}> does not have {value} in its list; nothing to remove"
+            )
 
         # Minted before _plan(), not after -- _plan() needs this transition's
         # own assertion IRI to write holon:currentAssertion in the scalar
@@ -519,17 +582,18 @@ WHERE {{
         full_update = f"{_PREFIXES}\n{ledger_insert}\n;\n{scene_update}"
         await client.update(conn, full_update)
 
-        confirmed_value, confirmed_assertion = await _read_current(
-            client, conn, fluent=fluent
+        confirmed_value = await _confirm_own_assertion(
+            client, conn, events_graph=events_graph, assertion_iri=assertion_iri
         )
-        if confirmed_assertion != assertion_iri:
+        if confirmed_value is None:
             # Lost the race on the live commit: another writer's transition
             # landed between our read and our write. Retry from a fresh
             # read, same as sequence.mint(). This is a live-commit
             # concurrency loss, distinct from a pre-commit shapes
             # rejection above -- the latter is never worth retrying, since
             # the same violation would just recur. Nothing of ours was
-            # written: the ledger append shares the scene update's guard.
+            # written: the ledger append shares the scene update's guard,
+            # so our ledger entry exists if and only if the update fired.
             continue
 
         await _evaluate_state_triggers(client, conn, fluent=fluent)
@@ -538,7 +602,7 @@ WHERE {{
             fluent=fluent,
             operation=operation,
             old_value=current,
-            new_value=confirmed_value or new_value,
+            new_value=confirmed_value,
             assertion_iri=assertion_iri,
             superseded=current_assertion,
             sequence_id=minted.iri,

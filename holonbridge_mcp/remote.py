@@ -265,7 +265,14 @@ def build_app(mcp, transport: str):  # noqa: ANN001 - FastMCP instance
         )
     routes.append(Mount("/", app=transport_app))
 
-    app = Starlette(routes=routes)
+    # transport_app carries its own lifespan (mcp.streamable_http_app() sets
+    # `lifespan=lambda app: self.session_manager.run()` internally) -- a bare
+    # Mount() does not propagate a sub-app's lifespan to its parent, so
+    # without this the StreamableHTTPSessionManager's run() never starts and
+    # every request past the gate fails with "Task group is not initialized.
+    # Make sure to use run()." SSE never hit this: mcp.sse_app() doesn't use
+    # the same session-manager/task-group pattern.
+    app = Starlette(routes=routes, lifespan=transport_app.router.lifespan_context)
     if oauth_config is not None:
         app.state.github_oauth_config = oauth_config
         app.state.oauth_state = github_oauth.OAuthState()

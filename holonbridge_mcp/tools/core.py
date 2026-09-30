@@ -80,8 +80,14 @@ async def sparql_select(query: str, graph: str | None = None) -> dict:
 
 
 @mcp.tool()
-async def sparql_construct(query: str, graph: str | None = None) -> str:
-    """Run a SPARQL CONSTRUCT or DESCRIBE. Returns Turtle."""
+async def sparql_construct(query: str, graph: str | None = None) -> str | dict:
+    """Run a SPARQL CONSTRUCT or DESCRIBE. Returns Turtle.
+
+    On a refusal (for example a 403 for a graph you may not read) this
+    returns the bridge's error object instead of Turtle, hence the
+    ``str | dict`` return type -- annotated as ``str`` alone, a refusal
+    failed FastMCP's output validation and hid the bridge's reason.
+    """
     return await _call(
         "POST", "/sparql/construct", json_body={"query": query, "graph": graph}, text=True
     )

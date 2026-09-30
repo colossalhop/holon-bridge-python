@@ -35,6 +35,12 @@ alongside ``person`` -- equal to it, with ``acting_as`` False, when no
 override is active -- so any caller (route or MCP tool) that specifically
 needs the authenticated identity rather than the currently-acting-as one
 has a field to read instead of having to know about this store directly.
+
+CHANGED 2026-09-30 (audit): ``require_conn`` and ``require_animus`` also
+put the resolved ``Conn`` and ``Animus`` on ``request.state``, which is
+where ``holonbridge.audit.AuditMiddleware`` reads them after the response.
+The middleware runs outside the dependency graph, so this is the only way
+it can learn who acted, and on which dataset.
 """
 
 from __future__ import annotations
@@ -124,7 +130,7 @@ def require_conn(
     override = request.headers.get(DATASET_OVERRIDE_HEADER)
     bank_name = request.query_params.get("bank")
     try:
-        return resolve_conn(
+        conn = resolve_conn(
             settings=settings,
             banks=banks,
             override=override,
@@ -136,6 +142,8 @@ def require_conn(
         ) from exc
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    request.state.conn = conn  # read by holonbridge.audit.AuditMiddleware
+    return conn
 
 
 async def require_animus(
@@ -199,17 +207,21 @@ async def require_animus(
         target = None
 
     if target is None:
-        return dataclasses.replace(
+        animus = dataclasses.replace(
             real, real_person=real.person, real_person_label=real.person_label
         )
+        request.state.animus = animus  # read by holonbridge.audit.AuditMiddleware
+        return animus
 
     impersonated = await build_animus_as(query_fn, conn.holons_graph, person=target)
-    return dataclasses.replace(
+    animus = dataclasses.replace(
         impersonated,
         real_person=real.person,
         real_person_label=real.person_label,
         acting_as=True,
     )
+    request.state.animus = animus  # read by holonbridge.audit.AuditMiddleware
+    return animus
 
 
 ConnDep = Annotated[Conn, Depends(require_conn)]

@@ -11,12 +11,26 @@ introduced. The merge happens server-side in a scratch graph via SPARQL
 
 Jena is the validator by default so RDF 1.2 payloads are handled correctly.
 ``pyshacl`` is supported as an offline fallback for Turtle 1.1 only.
+
+CHANGED 2026-09-30: context-aware validation. Everything above validates the
+target graph *alone*, which is wrong for a shape that needs the ontology
+visible -- a SPARQL constraint over a property *classified* in the ontology
+graph, or a ``sh:class`` check against a class declared there. Validated on
+its own, the first is vacuous (no focus node exists) and the second reports a
+false violation for every correct node. ``validate_full`` and
+``validate_delta`` now take ``context_graphs``: read-only graphs ``ADD``-ed to
+the scratch copy before validating. ``validate_context_pack`` runs the
+dataset's second shapes graph (``urn:{dataset}:shacl-context``) that way, and
+``combine_reports`` folds its result into the ordinary one. No ``GRAPH``
+keyword is involved, so the graph-crossing guard below is unaffected; a
+context pack is ordinary flat SPARQL evaluated over a merged graph.
 """
 
 from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -202,6 +216,7 @@ async def validate_full(
     target_graph: str | None = None,
     write_mode: str = "merge",
     reduction_rule_id: str | None = None,
+    context_graphs: Sequence[str] = (),
 ) -> ValidationReport:
     """Validate a payload in isolation, or combined with a target graph.
 
@@ -218,11 +233,17 @@ async def validate_full(
     needs to look like. This is mechanism only: the bridge does not know or
     care what "reduction" means for any particular temporal model, only that
     a rule can be designated to compute it.
+
+    ``context_graphs`` are read-only graphs added to the scratch copy after
+    the payload (and after any reduction) and before validating, so a shape
+    that needs them visible -- the ontology, typically -- can see them. They
+    are copied, never modified. Each IRI is checked before any Fuseki call.
     """
     shapes = await client.get_graph(conn, shapes_graph)
     if not shapes.strip():
         raise ValueError(f"shapes graph <{shapes_graph}> is empty or absent")
     _reject_graph_crossing_constraints(shapes)
+    context_graphs = _checked_context_graphs(context_graphs)
 
     scratch = _scratch_iri(conn)
     try:
@@ -235,6 +256,10 @@ async def validate_full(
         await client.post_graph(conn, scratch, turtle)
         if reduction_rule_id:
             await _apply_reduction(client, conn, reduction_rule_id, scratch)
+        # Context goes in AFTER reduction: a reduction rule replaces the
+        # scratch graph's content with its CONSTRUCT result, so anything added
+        # before it would be discarded, or reduced as if it were candidate state.
+        await _add_context(client, conn, scratch, context_graphs)
         report = await client.shacl_validate(
             conn, target_graph=scratch, shapes_turtle=shapes
         )
@@ -253,6 +278,7 @@ async def validate_delta(
     target_graph: str,
     write_mode: str = "merge",
     reduction_rule_id: str | None = None,
+    context_graphs: Sequence[str] = (),
 ) -> ValidationReport:
     """Report only the violations this payload introduces.
 
@@ -271,20 +297,46 @@ async def validate_delta(
     than validating it in place, which is a real increment on its own and is
     deliberately not folded into this one -- a half-solved version of "reduce
     the baseline too" would be worse than clearly not doing it yet.
+
+    ``context_graphs`` are merged into BOTH sides of the comparison. That is
+    not optional: the live target does not have the context merged into it,
+    so validating the baseline in place while validating a context-merged
+    candidate would report every violation the context itself carries (an
+    ontology node failing a shape, say) as introduced by the payload. With
+    context the baseline is therefore built in its own scratch graph, exactly
+    as the merged state is. Without context the baseline is validated in
+    place, as before.
     """
     shapes = await client.get_graph(conn, shapes_graph)
     if not shapes.strip():
         raise ValueError(f"shapes graph <{shapes_graph}> is empty or absent")
     _reject_graph_crossing_constraints(shapes)
+    context_graphs = _checked_context_graphs(context_graphs)
 
     scratch = _scratch_iri(conn)
+    baseline_scratch = _scratch_iri(conn) if context_graphs else None
     try:
         # Baseline: the target exactly as it stands, validated in place. A
         # target that does not exist yet has no baseline -- and asking Jena
         # to validate a graph it has never seen is a 404, not an empty
         # report, so the check has to happen before the call rather than
         # around it.
-        if await _graph_has_content(client, conn, target_graph):
+        if baseline_scratch is not None:
+            # With context, the baseline is built like the merged state below.
+            if await _graph_has_content(client, conn, target_graph):
+                await client.update(
+                    conn, f"COPY SILENT GRAPH <{target_graph}> TO <{baseline_scratch}>"
+                )
+            await _add_context(client, conn, baseline_scratch, context_graphs)
+            if await _graph_has_content(client, conn, baseline_scratch):
+                baseline = parse_report(
+                    await client.shacl_validate(
+                        conn, target_graph=baseline_scratch, shapes_turtle=shapes
+                    )
+                )
+            else:
+                baseline = ValidationReport(conforms=True, mode="delta")
+        elif await _graph_has_content(client, conn, target_graph):
             baseline = parse_report(
                 await client.shacl_validate(
                     conn, target_graph=target_graph, shapes_turtle=shapes
@@ -302,12 +354,15 @@ async def validate_delta(
         await client.post_graph(conn, scratch, turtle)
         if reduction_rule_id:
             await _apply_reduction(client, conn, reduction_rule_id, scratch)
+        await _add_context(client, conn, scratch, context_graphs)
         merged_turtle = await client.shacl_validate(
             conn, target_graph=scratch, shapes_turtle=shapes
         )
         merged = parse_report(merged_turtle)
     finally:
         await client.drop_graph(conn, scratch)
+        if baseline_scratch is not None:
+            await client.drop_graph(conn, baseline_scratch)
 
     known = {_fingerprint(r) for r in baseline.results}
     introduced = [r for r in merged.results if _fingerprint(r) not in known]
@@ -321,6 +376,126 @@ async def validate_delta(
         turtle=merged_turtle,
         mode="delta",
     )
+
+
+# --- context-aware validation --------------------------------------------------
+#
+# A dataset may keep a second shapes graph, ``urn:{dataset}:shacl-context``,
+# for shapes that only make sense with the ontology visible alongside the
+# data. The ordinary shapes graph is validated against the target alone (so a
+# shape there is correct on the target graph by itself); this one is
+# validated against the target merged with ``conn.validation_context_graphs``.
+# The two are reported together. A dataset with no content in the context
+# shapes graph behaves exactly as it did before this existed.
+#
+# Context graph IRIs are interpolated into SPARQL, so they are checked
+# before any Fuseki call. They come from ``Conn`` (derived from the dataset),
+# never from a request: merging an arbitrary caller-named graph into a
+# scratch copy and returning the validation results would be a way to read a
+# graph the caller may not be entitled to.
+
+_GRAPH_IRI_UNSAFE = frozenset('<>"{}|^`\\')
+
+
+def _checked_context_graphs(context_graphs: Sequence[str]) -> tuple[str, ...]:
+    """Validate every context graph IRI up front, before any scratch work."""
+    if isinstance(context_graphs, str):
+        raise TypeError("context_graphs must be a sequence of IRIs, not a single string")
+    checked: list[str] = []
+    for graph in context_graphs:
+        if not graph or any(
+            ch in _GRAPH_IRI_UNSAFE or ch.isspace() or ord(ch) < 0x20 for ch in graph
+        ):
+            raise ValueError(f"{graph!r} cannot be used as a validation context graph IRI")
+        checked.append(graph)
+    return tuple(checked)
+
+
+async def _add_context(
+    client: FusekiClient, conn: Conn, scratch: str, context_graphs: Sequence[str]
+) -> None:
+    """Copy each context graph's triples into ``scratch``. Read-only with
+    respect to the context graphs; ``SILENT`` so an absent one is a no-op."""
+    for graph in context_graphs:
+        await client.update(conn, f"ADD SILENT GRAPH <{graph}> TO <{scratch}>")
+
+
+async def validate_context_pack(
+    client: FusekiClient,
+    conn: Conn,
+    *,
+    turtle: str,
+    target_graph: str | None,
+    delta: bool,
+    write_mode: str = "merge",
+    reduction_rule_id: str | None = None,
+) -> ValidationReport | None:
+    """Validate against the dataset's context shapes graph, with the dataset's
+    context graphs merged in. Returns ``None`` when the dataset has no context
+    shapes -- the graph is absent or empty -- so callers can treat "no pack" as
+    "nothing to add" and carry on.
+
+    ``delta=True`` needs a ``target_graph`` and reports only what the payload
+    introduces, like :func:`validate_delta`; otherwise the merged state is
+    validated in full, like :func:`validate_full`.
+    """
+    if not await _graph_has_content(client, conn, conn.context_shapes_graph):
+        return None
+    common: dict[str, Any] = {
+        "turtle": turtle,
+        "shapes_graph": conn.context_shapes_graph,
+        "write_mode": write_mode,
+        "reduction_rule_id": reduction_rule_id,
+        "context_graphs": conn.validation_context_graphs,
+    }
+    if delta:
+        if target_graph is None:
+            raise ValueError("delta validation of the context pack requires a target_graph")
+        return await validate_delta(client, conn, target_graph=target_graph, **common)
+    return await validate_full(client, conn, target_graph=target_graph, **common)
+
+
+def combine_reports(
+    local: ValidationReport,
+    context: ValidationReport | None,
+    *,
+    context_shapes_graph: str | None = None,
+    context_graphs: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Fold the context pack's report into the ordinary one.
+
+    With no context report this is exactly ``local.as_dict()``. With one, the
+    top-level ``conforms``, ``violations``, ``warnings`` and ``results`` cover
+    both packs (each result tagged with its ``pack``), ``report`` stays the
+    ordinary pack's Turtle, and ``packs`` carries the per-pack breakdown,
+    including the context pack's own Turtle report. The two Turtle reports are
+    kept apart on purpose: concatenating them would merge their blank nodes.
+    """
+    payload = local.as_dict()
+    if context is None:
+        return payload
+    payload["conforms"] = local.conforms and context.conforms
+    payload["violations"] = len(local.blocking) + len(context.blocking)
+    payload["warnings"] = len(local.advisory) + len(context.advisory)
+    payload["results"] = [{**r, "pack": "local"} for r in local.results] + [
+        {**r, "pack": "context"} for r in context.results
+    ]
+    payload["packs"] = {
+        "local": {
+            "conforms": local.conforms,
+            "violations": len(local.blocking),
+            "warnings": len(local.advisory),
+        },
+        "context": {
+            "shapes_graph": context_shapes_graph,
+            "context_graphs": list(context_graphs),
+            "conforms": context.conforms,
+            "violations": len(context.blocking),
+            "warnings": len(context.advisory),
+            "report": context.turtle,
+        },
+    }
+    return payload
 
 
 async def _apply_reduction(

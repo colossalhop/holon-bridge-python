@@ -47,6 +47,15 @@ payload) and what authorised the write are now also handed to
 ``holonbridge.audit.annotate``, which the audit middleware folds into that
 request's audit entry -- including for a refused write, so a denial says
 which graph and why. ``annotate`` is a no-op outside a request.
+
+CHANGED 2026-09-30 (context pack): when the caller did not name a shapes
+graph of their own, the write is also validated against the dataset's
+context shapes graph (``urn:{dataset}:shacl-context``) with the dataset's
+ontology merged into the validation target -- see
+``shacl.validate_context_pack``. The two results are combined and either
+can refuse the write with a 422. A dataset with no context shapes is
+validated exactly as before. A caller-supplied ``shapes_graph`` means
+"validate against exactly this", so the context pack is not added to it.
 """
 
 from __future__ import annotations
@@ -149,13 +158,34 @@ async def write_turtle_to_graph(
                         write_mode=mode,
                         reduction_rule_id=reduction_rule_id,
                     )
+
+                # The dataset's context pack, if it has one, runs alongside the
+                # ordinary shapes -- but only when the caller did not pick a
+                # shapes graph of their own: an explicit shapes_graph means
+                # "validate against exactly this".
+                context_report = None
+                if shapes_graph is None:
+                    context_report = await shacl_mod.validate_context_pack(
+                        client,
+                        conn,
+                        turtle=turtle,
+                        target_graph=graph_iri,
+                        delta=shacl_delta,
+                        write_mode=mode,
+                        reduction_rule_id=reduction_rule_id,
+                    )
             except ValueError as exc:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
             except FusekiError as exc:
                 raise HTTPException(exc.status or 502, detail=exc.as_dict()) from exc
 
-            report_payload = report.as_dict()
-            if not report.conforms:
+            report_payload = shacl_mod.combine_reports(
+                report,
+                context_report,
+                context_shapes_graph=conn.context_shapes_graph,
+                context_graphs=conn.validation_context_graphs,
+            )
+            if not report_payload["conforms"]:
                 raise HTTPException(
                     422,
                     detail={"error": "shacl_violation", **report_payload},

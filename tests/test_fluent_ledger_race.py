@@ -259,7 +259,7 @@ async def test_a_lost_race_writes_nothing_to_the_ledger(monkeypatch):
     monkeypatch.setattr(fluent_mod, "_read_current", stale_first)
     result = await update_fluent(store, conn, fluent=FLUENT, operation=Operation.SET, value=9, asserted_by=BOB)
 
-    assert calls["n"] >= 3  # stale read, fresh read, and the confirmation read-back
+    assert calls["n"] == 2  # the stale read, then the fresh one the retry made: one lost attempt
     assert len(store.ledger(conn)) == 3  # seed + winner + this transition; no orphan from the lost attempt
     assert len(store.live(conn)) == 1
     assert store.forks(conn) == {}

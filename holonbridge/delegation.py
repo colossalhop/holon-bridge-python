@@ -239,6 +239,12 @@ async def find_delegation(
     )
     current = _now_expr(now)
 
+    # Both negative conditions merged into one FILTER NOT EXISTS via UNION,
+    # not two separate FILTER NOT EXISTS clauses -- see this change's own
+    # commit message for why. covered_graphs() below looks almost identical
+    # but substitutes a fixed delegator IRI rather than binding ?delegator
+    # as a variable, and does not hit this; left as two clauses there since
+    # there's nothing to fix.
     query = f"""PREFIX holon: <{HOLON}>
 SELECT DISTINCT ?d ?delegator ?persona WHERE {{
   GRAPH <{holons_graph}> {{
@@ -253,8 +259,11 @@ SELECT DISTINCT ?d ?delegator ?persona WHERE {{
     ?delegator a holon:Person .
     {delegator_clause}
     FILTER (?from <= {current} && {current} < ?until)
-    FILTER NOT EXISTS {{ ?d holon:revokedAt ?revoked }}
-    FILTER NOT EXISTS {{ ?delegator holon:status "inactive" }}
+    FILTER NOT EXISTS {{
+      {{ ?d holon:revokedAt ?revoked }}
+      UNION
+      {{ ?delegator holon:status "inactive" }}
+    }}
   }}
 }} ORDER BY ?d"""
     rows = _bindings(await _run(query_fn, query))

@@ -13,16 +13,28 @@ request carrying that particular tool call.
 
 This still works, and deliberately relies on a specific, verified property
 of that spawn rather than assuming it: both asyncio's and anyio's task
-creation copy the *current* contextvars context into the new task. For the
-SSE transport, the task group in ``Server.run`` is created once per
-session, from the context active when the ``GET /sse`` connection itself
-was authorized -- individual tool-invoking messages arrive later over a
-separate ``POST /messages/`` request that merely feeds the session's
-queue, and do not themselves contribute to that inherited context. So the
-identity only needs to be captured once, at that connection, not
-re-threaded on every message -- which is also the right granularity
-functionally, since a session authenticates once and keeps one identity
-for its lifetime.
+creation copy the *current* contextvars context into the new task. What
+varies by transport is *which* request's context that is.
+
+**SSE.** The task group in ``Server.run`` is created once per session, from
+the context active when the ``GET /sse`` connection itself was authorized --
+individual tool-invoking messages arrive later over a separate
+``POST /messages/`` request that merely feeds the session's queue, and do
+not themselves contribute to that inherited context. So the identity only
+needs to be captured once, at that connection, not re-threaded on every
+message -- which is also the right granularity functionally, since a
+session authenticates once and keeps one identity for its lifetime.
+
+**Streamable HTTP.** Served *stateless* (``remote._require_stateless``), so
+there is no long-lived session. Each POST to ``/mcp`` starts its own server
+task from that request's context, which ``BearerGate`` has just set, and the
+tool call runs in it. Every request is therefore authenticated and
+identified on its own, and a token that expires or is replaced takes effect
+on the next request. The SDK's default *stateful* mode would not give this:
+its per-session task is started from the request that created the session,
+so every later request on that session would run as the first caller, whatever
+token it presented. ``tests/test_mcp_streamable_identity.py`` pins the
+stateless behaviour end to end through the real SDK.
 
 ``None`` means "this credential is valid but carries no per-user
 identity" -- the static shared token (``MCP_INBOUND_TOKEN``) is exactly

@@ -45,6 +45,14 @@ runs each request in its own task started from that request's context, which
 is the one ``BearerGate`` has just set. SSE is unaffected: it authenticates
 once per connection and keeps that identity for the connection's life, as
 before.
+
+CHANGED 2026-10-04 (b): a 401 on ``/mcp`` now carries a ``resource_metadata``
+parameter in ``WWW-Authenticate`` pointing at that path's RFC 9728 metadata
+document, when OAuth is configured. The MCP authorization spec has a client
+learn where the authorization server is from this challenge. A fresh
+Streamable HTTP connector could not complete discovery against the bare
+``Bearer`` challenge. ``/sse`` keeps the bare challenge: connectors registered
+against it work with it today, and it is left exactly as it was.
 """
 
 from __future__ import annotations
@@ -93,6 +101,10 @@ _TRANSPORT_PATHS: dict[str, str] = {
     "both": "/sse (legacy) and /mcp",
 }
 
+#: The Streamable HTTP endpoint, and where its RFC 9728 metadata lives.
+MCP_PATH = "/mcp"
+MCP_RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource/mcp"
+
 
 class _RejectedType:
     """Sentinel: a checker does not accept the presented credential.
@@ -124,16 +136,27 @@ class BearerGate:
     Deliberately ASGI rather than Starlette's ``BaseHTTPMiddleware``: that one
     buffers the response, which breaks SSE. A middleware that silently turns a
     stream into a single blob is a bad way to discover the difference.
+
+    ``public_url`` is this server's externally reachable base URL, when GitHub
+    OAuth is configured. It is only used to build the ``resource_metadata``
+    parameter on a 401 for the Streamable HTTP endpoint; without it every 401
+    carries the plain ``Bearer`` challenge.
     """
 
     def __init__(
-        self, app: Callable, checkers: list[Checker], *, open_paths: tuple[str, ...]
+        self,
+        app: Callable,
+        checkers: list[Checker],
+        *,
+        open_paths: tuple[str, ...],
+        public_url: str | None = None,
     ) -> None:
         if not checkers:
             raise ValueError("BearerGate needs at least one credential checker")
         self._app = app
         self._checkers = checkers
         self._open_paths = open_paths
+        self._public_url = public_url.rstrip("/") if public_url else None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -156,7 +179,7 @@ class BearerGate:
                 send,
                 401,
                 b'{"error":"unauthorized"}',
-                extra=[(b"www-authenticate", b"Bearer")],
+                extra=[(b"www-authenticate", self._challenge(scope.get("path", "")))],
             )
             return
 
@@ -172,6 +195,19 @@ class BearerGate:
             await self._app(scope, receive, send)
         finally:
             current_github_login.reset(token)
+
+    def _challenge(self, path: str) -> bytes:
+        """The ``WWW-Authenticate`` value for a 401 on ``path``.
+
+        Plain ``Bearer`` everywhere except the Streamable HTTP endpoint with
+        OAuth configured, where it also says where the protected-resource
+        metadata is (RFC 9728 §5.1) so a client can find the authorization
+        server from the challenge itself.
+        """
+        if self._public_url and (path == MCP_PATH or path.startswith(MCP_PATH + "/")):
+            url = f"{self._public_url}{MCP_RESOURCE_METADATA_PATH}"
+            return f'Bearer resource_metadata="{url}"'.encode()
+        return b"Bearer"
 
     def _authorised(self, scope: Scope) -> "str | None | _RejectedType":
         for name, value in scope.get("headers", []):
@@ -336,7 +372,12 @@ def build_app(mcp, transport: str):  # noqa: ANN001 - FastMCP instance
         app.state.github_oauth_config = oauth_config
         app.state.oauth_state = github_oauth.OAuthState()
 
-    return BearerGate(app, checkers, open_paths=open_paths)
+    return BearerGate(
+        app,
+        checkers,
+        open_paths=open_paths,
+        public_url=oauth_config.public_url if oauth_config is not None else None,
+    )
 
 
 def serve(mcp, *, transport: str, host: str, port: int) -> None:  # noqa: ANN001

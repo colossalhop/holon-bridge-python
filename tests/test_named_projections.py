@@ -1,11 +1,16 @@
 """Named-projection registry and route tests.
 
-Mirrors test_named_queries.py's stub-at-the-Fuseki-boundary approach, but
-routes ACL/identity through the AnimusDep + acl.py path for real, rather
-than the bearer-token-only ``auth()`` this file's sibling still uses (that
-helper predates ``require_animus`` -- see deps.py's own module docstring
--- and is why test_named_queries.py currently 401s end to end; not fixed
-here, out of scope for this PR).
+Stub-at-the-Fuseki-boundary, routing ACL/identity through the AnimusDep +
+acl.py path for real. The identity, grant, Toolset and audit-config answers
+now live in ``tests/_identity.py`` (``IdentityStub``), shared with the other
+route tests; this stub only adds the named-query and named-projection
+registries.
+
+``stub.executed`` means "what the backend was asked to run for the user's
+benefit": it records the projection's CONSTRUCT and nothing else. The bridge
+issues plenty of incidental reads on every request (parameter-schema lookup,
+the audit config row), and a catch-all that recorded those made the run tests
+assert on the bridge's plumbing rather than on what they were about.
 """
 
 from __future__ import annotations
@@ -16,10 +21,8 @@ from fastapi.testclient import TestClient
 from holonbridge.config import Settings
 from holonbridge.server import create_app
 
-TOKEN = "test-token"
-PERSON_IRI = "urn:ds:person:kurt"
-PERSON_LABEL = "Kurt"
-EXTERNAL_ID = "kurtcagle"
+from ._identity import TOKEN, IdentityStub, auth
+from ._identity import row as _row
 
 HB_NS = "https://w3id.org/holonbridge/"
 HB_QUERY_TYPE = f"{HB_NS}NamedQuery"
@@ -35,10 +38,6 @@ UPDATE_QUERY_IRI = "urn:ds:named-query:clear-thing"
 UPDATE_QUERY_SPARQL = "DELETE WHERE { GRAPH <urn:ds:holons> { ?s ?p ?o } }"
 
 PROJECTION_IRI = "https://w3id.org/holonbridge/projection/describe-thing-ace"
-
-
-def _row(**cells: str) -> dict:
-    return {key: {"value": value} for key, value in cells.items()}
 
 
 def query_registry_rows() -> list[dict]:
@@ -68,14 +67,11 @@ def projection_registry_rows(prompt_text: str = "Rendered: {{result}}") -> list[
     ]
 
 
-class RegistryStub:
-    """Serves identity resolution, the named-query and named-projection
-    registries, and ACL grant checks, all keyed off substrings in the
-    SPARQL text -- same technique test_named_queries.py's RegistryStub
-    already uses for the registry queries themselves.
-    """
+class RegistryStub(IdentityStub):
+    """Identity/ACL/Toolset from ``IdentityStub``, plus the two registries."""
 
     def __init__(self) -> None:
+        super().__init__()
         self.query_rows = query_registry_rows()
         self.query_param_rows = query_param_rows()
         self.projection_rows: list[dict] = []
@@ -83,50 +79,19 @@ class RegistryStub:
         self.updates: list[str] = []
         self.construct_result = "<urn:ex:thing> <urn:ex:label> \"A Thing\" .\n"
 
-        # ACL knobs -- an ordinary (non-admin) founder with an explicit
-        # grant, matching acl.py's own stated default posture (appends are
-        # the norm; admin bypass is a separate, narrowly-held axis).
-        self.admin = False
-        self.write_grant = True
-        self.replace_grant = True
-
-        # Toolset knobs -- empty means "nothing restricted", matching a
-        # dataset with no holon:Toolset resources at all (everything
-        # universal). A test that wants a restricted, unreachable query
-        # populates restricted_tools with that query's IRI and leaves
-        # persona_reachable_tools empty.
-        self.restricted_tools: set[str] = set()
-        self.persona_reachable_tools: set[str] = set()
-
     async def select(self, conn, query, *, default_graph=None):
-        if "hasExternalIdentity" in query:
-            return {"results": {"bindings": [_row(person=PERSON_IRI, label=PERSON_LABEL)]}}
-        if "memberOfTeam" in query:
-            return {"results": {"bindings": []}}
-        if "role:admin" in query:
-            return {"boolean": self.admin}
-        if "grantsWrite" in query:
-            return {"boolean": self.admin or self.write_grant}
-        if "grantsReplace" in query:
-            return {"boolean": self.admin or self.replace_grant}
-        if "deniedTo" in query:
-            return {"boolean": False}
-        if "holon:hasToolset" in query:
-            hits = [t for t in self.persona_reachable_tools]
-            return {"results": {"bindings": [_row(tool=t) for t in hits]}}
-        if "anyToolset" in query:
-            hits = [t for t in self.restricted_tools]
-            return {"results": {"bindings": [_row(tool=t) for t in hits]}}
+        infra = self.infra_select(query)
+        if infra is not None:
+            return infra
         if "?link" in query:
             return {"results": {"bindings": self.query_param_rows}}
         if "NamedProjection" in query:
             return {"results": {"bindings": self.projection_rows}}
         if "NamedQuery" in query:
             return {"results": {"bindings": self.query_rows}}
-        self.executed.append(query)
         return {"results": {"bindings": []}}
 
-    async def construct(self, conn, query, *, default_graph=None):
+    async def construct(self, conn, query, *, default_graph=None, timeout=None):
         self.executed.append(query)
         return self.construct_result
 
@@ -166,10 +131,6 @@ def client(stub: RegistryStub):
     with TestClient(app) as test_client:
         app.state.fuseki = stub
         yield test_client
-
-
-def auth() -> dict[str, str]:
-    return {"Authorization": f"Bearer {TOKEN}", "x-holon-animus-id": EXTERNAL_ID}
 
 
 # --- registration ---------------------------------------------------------

@@ -16,7 +16,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from holonbridge_mcp import github_oauth as oauth
-from holonbridge_mcp import remote
+from holonbridge_mcp import remote, session
 
 
 class FakeMcp:
@@ -244,6 +244,13 @@ def test_a_static_token_does_not_verify_as_a_jwt_and_vice_versa(monkeypatch):
 
 
 # --- transport security (DNS-rebinding) -------------------------------------
+#
+# ``_transport_security`` moved from server.py to session.py on 2026-08-28. It
+# is a pure function of the environment, so these call it directly. They used
+# to ``importlib.reload`` the server module to rebuild the global FastMCP
+# instance, which after the move re-read nothing (the instance is built in
+# session.py) and, done properly, would orphan every tool registered on the
+# old instance for the rest of the suite.
 
 
 def test_the_tunnel_hostname_is_allowed_past_dns_rebinding_protection(monkeypatch):
@@ -261,14 +268,8 @@ def test_the_tunnel_hostname_is_allowed_past_dns_rebinding_protection(monkeypatc
     """
     monkeypatch.setenv("MCP_PUBLIC_URL", "https://bridge.example.ngrok.io")
 
-    import importlib
+    settings = session._transport_security()
 
-    import holonbridge_mcp.server as server
-
-    importlib.reload(server)
-
-    settings = server.mcp.settings.transport_security
-    assert settings is not None
     assert "bridge.example.ngrok.io" in settings.allowed_hosts
     # localhost must survive too — the same process is still reachable directly
     assert "127.0.0.1" in settings.allowed_hosts
@@ -280,13 +281,8 @@ def test_extra_allowed_hosts_can_be_declared_explicitly(monkeypatch):
     monkeypatch.setenv("MCP_PUBLIC_URL", "https://bridge.example.ngrok.io")
     monkeypatch.setenv("MCP_ALLOWED_HOSTS", "proxy.internal, other.example.com")
 
-    import importlib
+    hosts = session._transport_security().allowed_hosts
 
-    import holonbridge_mcp.server as server
-
-    importlib.reload(server)
-
-    hosts = server.mcp.settings.transport_security.allowed_hosts
     assert "proxy.internal" in hosts
     assert "other.example.com" in hosts
     assert "bridge.example.ngrok.io" in hosts
@@ -296,12 +292,7 @@ def test_with_no_public_url_only_localhost_is_allowed(monkeypatch):
     monkeypatch.delenv("MCP_PUBLIC_URL", raising=False)
     monkeypatch.delenv("MCP_ALLOWED_HOSTS", raising=False)
 
-    import importlib
+    hosts = session._transport_security().allowed_hosts
 
-    import holonbridge_mcp.server as server
-
-    importlib.reload(server)
-
-    hosts = server.mcp.settings.transport_security.allowed_hosts
     assert "127.0.0.1" in hosts
     assert not any("ngrok" in h for h in hosts)

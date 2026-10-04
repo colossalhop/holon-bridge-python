@@ -4,6 +4,12 @@ The stub answers COUNT queries by inspecting which graph is on which side of
 the ``FILTER NOT EXISTS``, so the three write modes can be told apart by the
 updates they issue and the counts they report — without implementing a
 triplestore.
+
+Identity, ACL, Toolset and audit-config answers come from ``IdentityStub`` in
+``tests/_identity.py``. Every route here depends on ``require_animus`` (and the
+write routes on ``check_write`` / ``check_replace``), so a bearer token alone
+gets a 401; ``auth()`` adds the animus header and the stub resolves it to an
+ordinary non-admin founder holding write and replace grants.
 """
 
 from __future__ import annotations
@@ -15,7 +21,9 @@ from holonbridge.config import Settings
 from holonbridge.fuseki import FusekiTimeout
 from holonbridge.server import create_app
 
-TOKEN = "test-token"
+from ._identity import TOKEN, IdentityStub, auth
+from ._identity import row as _row
+
 NS = "https://w3id.org/holonbridge/"
 RULE_TYPE = f"{NS}NamedRule"
 
@@ -31,10 +39,6 @@ ROSTER_BODY = (
     "WHERE { GRAPH <urn:ds:holons> { ?p <urn:onTeam> {{team}} } }"
 )
 FOCUS_BODY = "CONSTRUCT { $this <urn:derived> ?o } WHERE { GRAPH <urn:ds:holons> { $this <urn:src> ?o } }"
-
-
-def _row(**cells: str) -> dict:
-    return {key: {"value": value} for key, value in cells.items()}
 
 
 def rule_rows() -> list[dict]:
@@ -139,10 +143,11 @@ def rule_param_rows() -> list[dict]:
     ]
 
 
-class RuleStub:
+class RuleStub(IdentityStub):
     """Serves the rule registry and answers COUNT queries by shape."""
 
     def __init__(self) -> None:
+        super().__init__()
         self.rules = rule_rows()
         self.params = rule_param_rows()
         self.updates: list[str] = []
@@ -154,6 +159,9 @@ class RuleStub:
         self.turtle = "<urn:a> <urn:b> <urn:c> .\n"
 
     async def select(self, conn, query, *, default_graph=None):
+        infra = self.infra_select(query)
+        if infra is not None:
+            return infra
         if "COUNT(*)" in query:
             return {"results": {"bindings": [{"n": {"value": str(self._count(query))}}]}}
         if "?link" in query:
@@ -216,10 +224,6 @@ def client(stub: RuleStub):
     with TestClient(app) as test_client:
         app.state.fuseki = stub
         yield test_client
-
-
-def auth() -> dict[str, str]:
-    return {"Authorization": f"Bearer {TOKEN}"}
 
 
 def run(client, rule_id: str, **body):
@@ -466,3 +470,31 @@ def test_unknown_operation_is_rejected(client):
         "/graph-op", json={"operation": "obliterate", "target": "urn:ds:x"}, headers=auth()
     )
     assert response.status_code == 422
+
+
+# --- graph-op ACL (previously untested: the route is gated, the tests were not) ---
+
+
+def test_graph_op_clear_needs_a_replace_grant(client, stub):
+    stub.replace_grant = False
+    response = client.post(
+        "/graph-op", json={"operation": "clear", "target": "urn:ds:x"}, headers=auth()
+    )
+    assert response.status_code == 403
+    assert stub.updates == []
+
+
+def test_graph_op_create_needs_only_a_write_grant(client, stub):
+    stub.replace_grant = False
+    response = client.post(
+        "/graph-op", json={"operation": "create", "target": "urn:ds:x"}, headers=auth()
+    )
+    assert response.status_code == 200
+
+
+def test_graph_op_without_a_write_grant_is_refused(client, stub):
+    stub.write_grant = False
+    response = client.post(
+        "/graph-op", json={"operation": "create", "target": "urn:ds:x"}, headers=auth()
+    )
+    assert response.status_code == 403

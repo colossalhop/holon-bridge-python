@@ -9,10 +9,15 @@ what would make these tests interfere with each other if left alone.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from holonbridge import envfile
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture(autouse=True)
@@ -92,20 +97,35 @@ def test_loading_is_idempotent_within_one_process(tmp_path, monkeypatch):
     assert os.getenv("SOME_TEST_VAR") == "from-file"
 
 
-def test_both_entry_points_see_the_same_shared_file(tmp_path, monkeypatch):
-    """The property the user actually asked for: one file, both processes."""
+def test_both_entry_points_see_the_same_shared_file(tmp_path):
+    """The property the user actually asked for: one file, both processes.
+
+    ``holonbridge_mcp.session`` reads BEARER_TOKEN into ``BEARER`` at import
+    time (it moved there from ``server.py`` on 2026-08-28). Re-importing in this
+    process is not meaningful -- Python caches modules, and reloading ``session``
+    would build a second FastMCP instance and orphan every registered tool -- so
+    this starts a fresh interpreter in a directory containing only the ``.env``,
+    which is exactly what a second entry point launched there would be.
+    It also keeps the loaded value out of this process's ``os.environ``.
+    """
     write_env(tmp_path / ".env", BEARER_TOKEN="shared-value")
 
-    envfile.load_shared_env()
-    assert os.getenv("BEARER_TOKEN") == "shared-value"
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"BEARER_TOKEN", "HOLONBRIDGE_ENV_FILE"}
+    }
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(REPO_ROOT), env.get("PYTHONPATH", "")) if part
+    )
 
-    # holonbridge_mcp/server.py reads BEARER_TOKEN as BEARER at import time;
-    # re-import is not meaningful here (Python caches modules), so this
-    # exercises the same os.getenv() call that module makes, proving the
-    # value a fresh process would see is the same either way.
-    import importlib
-
-    import holonbridge_mcp.server as mcp_server
-
-    importlib.reload(mcp_server)
-    assert mcp_server.BEARER == "shared-value"
+    result = subprocess.run(
+        [sys.executable, "-c", "from holonbridge_mcp import session; print(session.BEARER)"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "shared-value"

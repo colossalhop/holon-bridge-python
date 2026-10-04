@@ -2,9 +2,9 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.9
+version: 1.0.10
 created: 2026-09-27
-updated: 2026-09-30
+updated: 2026-10-04
 author:
   - name: Kurt Cagle
     iri: https://holongraph.com/people/kurt-cagle
@@ -45,6 +45,10 @@ process:
    not needed yet.
 
 ## Log
+
+### 2026-10-04
+
+- **Fixed a Jena `ARQInternalErrorException: Peek iterator is already empty` crash in `find_delegation`.** Reproduced live against real Fuseki (not just the rdflib test harness, which cannot see this -- it's a Jena-specific ARQ optimizer bug): a 500 on every `check_write`/`authorize_query` call for an identity with no `grantsWrite`, whenever the delegation lookup falls through to this function on a dataset with zero matching `holon:Delegation` triples for the query's bound pattern. Isolated to the `FILTER NOT EXISTS { ?delegator holon:status "inactive" }` clause specifically -- `?delegator` is bound three ways in the same query (the `holon:delegator` join, the `a holon:Person` type check, and this filter), and Jena's optimizer mishandles the correlated re-reference when the outer pattern yields zero rows. Fixed by merging both negative conditions into one `FILTER NOT EXISTS` via `UNION` instead of two separate `FILTER NOT EXISTS` clauses. `covered_graphs` has the same two-clause shape but substitutes a fixed delegator IRI rather than binding `?delegator` as a variable -- confirmed live against Fuseki that this does *not* trigger the bug, so it's left alone. Verified three ways: isolated against real Fuseki clause-by-clause to find the exact trigger: the full existing `tests/test_delegation*.py` suite (91 tests, rdflib harness) still passes unchanged; and a live Fuseki round-trip with real fixture data (one active + one revoked delegation) confirms the fix returns exactly the active one, not just an empty result. [PR #43](https://github.com/kurtcagle/holon-bridge-python/pull/43)
 
 ### 2026-09-30
 
@@ -371,4 +375,10 @@ hb:release-2026-09-30-k a hb:ReleaseNote ;
     rdfs:label "Fluent updates: a transition is confirmed by its own ledger entry; mint exhaustion is a 409" ;
     dcterms:description "update_fluent confirmed a transition by comparing the scene graph's current assertion with its own, which failed for list-mode fluents (they never have one, so every ListInsert/ListRemove looped to the attempt limit writing 8 ledger entries, then raised), made a winner retry and re-apply its operation when a third writer landed before its read-back (an Insert delta counted twice), and could report someone else's value as newValue. Since PR 41 a transition's ledger entry exists exactly when it fired, so confirmation now asks the ledger for the transition's own entry. A ListRemove of a non-member is refused up front before an id is minted, and POST /fluent/update now maps SequenceError to a 409 like /sequence/mint instead of a bare 500. Tested against rdflib's SPARQL engine, not Jena: 8 of 9 new tests fail on the previous code." ;
     rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/42> .
+
+hb:release-2026-10-04-a a hb:ReleaseNote ;
+    dcterms:date "2026-10-04"^^xsd:date ;
+    rdfs:label "find_delegation: fixed a Jena ARQ crash on the common zero-delegations case" ;
+    dcterms:description "find_delegation 500'd against real Fuseki with ARQInternalErrorException: Peek iterator is already empty, on any dataset with no matching Delegation triples for the bound pattern -- the common case, hit via check_write/authorize_query for any identity with no grantsWrite. The rdflib test harness in tests/test_delegation*.py cannot see this; it's a Jena ARQ optimizer bug, not a logic error. Isolated live against Fuseki, clause by clause: FILTER NOT EXISTS { ?delegator holon:status \"inactive\" } is the trigger -- ?delegator is bound three ways in one query (the holon:delegator join, the Person type check, and this filter) and Jena mishandles the correlated re-reference when the outer pattern yields zero rows. Fixed by merging both FILTER NOT EXISTS clauses into one via UNION. covered_graphs has the same two-clause shape but binds a fixed delegator IRI, not a variable -- confirmed live this does not trigger the bug, left unchanged. Verified three ways: live Fuseki clause-by-clause bisection found the fix; the full 91-test suite still passes; a live round-trip with one active and one revoked delegation confirms correct filtering, not just absence of a crash." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/43> .
 ```

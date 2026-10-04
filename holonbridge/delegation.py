@@ -40,6 +40,7 @@ by the caller.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -153,6 +154,24 @@ def _iso(when: datetime) -> str:
     return when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _parse_dt(value: str) -> datetime | None:
+    """Tolerant xsd:dateTime parse (older Pythons reject a trailing ``Z``);
+    ``None`` on anything unparseable rather than raising, so one malformed
+    validity bound excludes that one delegation instead of crashing the
+    whole lookup. Duplicated from audit.py's own ``_parse_dt`` on purpose
+    -- this module imports nothing FastAPI-adjacent, see the module
+    docstring."""
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            parsed = datetime.fromisoformat(re.sub(r"\.\d+", "", text))
+        except ValueError:
+            return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 def _now_expr(now: datetime | None) -> str:
     """SPARQL expression for 'the current instant'. Production passes
     ``None`` and lets the store's own ``NOW()`` decide; tests inject a
@@ -224,29 +243,37 @@ async def find_delegation(
     remember to retract them.
 
     ``target`` is matched against the graph IRIs stored on the
-    delegation (``holon:delegatedGraph``), not recomputed from naming
-    rules, so this stays a plain triple lookup that costs the same as the
-    ``grantsWrite`` ASK it sits beside.
+    delegation (``holon:delegatedGraph``).
+
+    Deliberately NOT one correlated SPARQL query. Every version that was
+    -- a FILTER NOT EXISTS checking revocation/delegator-status, a FILTER
+    equality narrowing ?delegator, a VALUES binding instead of that same
+    FILTER, `holon:delegatedGraph` as its own triple on ?d merged into the
+    main predicate chain instead of spliced separately -- independently
+    reproduced a live Jena ``ARQInternalErrorException: Peek iterator is
+    already empty`` against real Fuseki, on a dataset with no matching
+    ``Delegation`` rows for the bound pattern (the common case: most
+    callers have no delegation set up at all). None of the individual
+    fixes composed; combining them still crashed. See this change's PR for
+    the full bisection. This fetches the simple candidate set in one
+    query -- no FILTER, FILTER NOT EXISTS, or VALUES beyond the plain join
+    -- confirmed safe against real Fuseki in every shape tried, then does
+    validity-window, revocation, delegator-status and target/delegator
+    narrowing here instead.
     """
     if permission not in PERMISSIONS:
         raise DelegationError(f"unknown permission {permission!r}")
 
     holons_graph = safe_iri(holons_graph)
     delegate = safe_iri(delegate)
-    target_clause = f"?d holon:delegatedGraph <{safe_iri(target)}> ." if target else ""
-    delegator_clause = (
-        f"FILTER(?delegator = <{safe_iri(delegator)}>)" if delegator else ""
-    )
-    current = _now_expr(now)
+    target_iri = safe_iri(target) if target is not None else None
+    delegator_iri = safe_iri(delegator) if delegator is not None else None
+    now_dt = (now or datetime.now(timezone.utc))
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
 
-    # Both negative conditions merged into one FILTER NOT EXISTS via UNION,
-    # not two separate FILTER NOT EXISTS clauses -- see this change's own
-    # commit message for why. covered_graphs() below looks almost identical
-    # but substitutes a fixed delegator IRI rather than binding ?delegator
-    # as a variable, and does not hit this; left as two clauses there since
-    # there's nothing to fix.
-    query = f"""PREFIX holon: <{HOLON}>
-SELECT DISTINCT ?d ?delegator ?persona WHERE {{
+    candidates_query = f"""PREFIX holon: <{HOLON}>
+SELECT ?d ?delegator ?persona ?from ?until WHERE {{
   GRAPH <{holons_graph}> {{
     ?d a holon:Delegation ;
        holon:delegate <{delegate}> ;
@@ -255,22 +282,55 @@ SELECT DISTINCT ?d ?delegator ?persona WHERE {{
        holon:delegatedPermission {_literal(permission)} ;
        holon:validFrom ?from ;
        holon:validUntil ?until .
-    {target_clause}
-    ?delegator a holon:Person .
-    {delegator_clause}
-    FILTER (?from <= {current} && {current} < ?until)
-    FILTER NOT EXISTS {{
-      {{ ?d holon:revokedAt ?revoked }}
-      UNION
-      {{ ?delegator holon:status "inactive" }}
-    }}
   }}
-}} ORDER BY ?d"""
-    rows = _bindings(await _run(query_fn, query))
-    return [
-        DelegationMatch(r["d"]["value"], r["delegator"]["value"], r["persona"]["value"])
-        for r in rows
-    ]
+}}"""
+    matches: list[DelegationMatch] = []
+    for row in _bindings(await _run(query_fn, candidates_query)):
+        d = row["d"]["value"]
+        row_delegator = row["delegator"]["value"]
+        persona = row["persona"]["value"]
+
+        valid_from = _parse_dt(row["from"]["value"])
+        valid_until = _parse_dt(row["until"]["value"])
+        if valid_from is None or valid_until is None:
+            continue  # unparseable validity window -- never active, not a crash
+        if not (valid_from <= now_dt < valid_until):
+            continue
+        if delegator_iri is not None and row_delegator != delegator_iri:
+            continue
+
+        revoked = await _run(
+            query_fn,
+            f'PREFIX holon: <{HOLON}>\nASK {{ GRAPH <{holons_graph}> {{ <{d}> holon:revokedAt ?r }} }}',
+        )
+        if revoked.get("boolean"):
+            continue
+
+        delegator_ok = await _run(
+            query_fn,
+            f'PREFIX holon: <{HOLON}>\nASK {{ GRAPH <{holons_graph}> {{ <{row_delegator}> a holon:Person }} }}',
+        )
+        if not delegator_ok.get("boolean"):
+            continue
+        delegator_inactive = await _run(
+            query_fn,
+            f'PREFIX holon: <{HOLON}>\nASK {{ GRAPH <{holons_graph}> {{ <{row_delegator}> holon:status "inactive" }} }}',
+        )
+        if delegator_inactive.get("boolean"):
+            continue
+
+        if target_iri is not None:
+            covers_target = await _run(
+                query_fn,
+                f'PREFIX holon: <{HOLON}>\nASK {{ GRAPH <{holons_graph}> {{ <{d}> holon:delegatedGraph <{target_iri}> }} }}',
+            )
+            if not covers_target.get("boolean"):
+                continue
+
+        matches.append(DelegationMatch(d, row_delegator, persona))
+
+    matches.sort(key=lambda m: m.delegation)
+    return matches
 
 
 @dataclass(frozen=True)

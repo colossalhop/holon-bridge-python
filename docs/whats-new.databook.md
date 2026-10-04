@@ -2,9 +2,9 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.9
+version: 1.0.10
 created: 2026-09-27
-updated: 2026-09-30
+updated: 2026-10-04
 author:
   - name: Kurt Cagle
     iri: https://holongraph.com/people/kurt-cagle
@@ -45,6 +45,10 @@ process:
    not needed yet.
 
 ## Log
+
+### 2026-10-04
+
+- **Fixed a Jena `ARQInternalErrorException: Peek iterator is already empty` crash in `find_delegation`.** Reproduced live against real Fuseki (not just the rdflib test harness, which cannot see this -- it's a Jena-specific ARQ optimizer bug): a 500 on every `check_write`/`authorize_query` call for an identity with no `grantsWrite`, whenever delegation lookup falls through to this function on a dataset with zero matching `holon:Delegation` triples for the bound pattern -- the common case, not an edge case. Took three rounds to actually fix, each one found by testing against the real shape `check_write` uses rather than trusting the previous round's fix: merging two `FILTER NOT EXISTS` clauses into one via `UNION` fixed the no-target case but not the with-target case every real write check hits; merging `holon:delegatedGraph` into the main predicate chain and swapping a `FILTER` equality on `?delegator` for `VALUES` each independently fixed their own isolated case but still crashed combined -- none of the SPARQL-level rewrites composed. Landed on replacing the one correlated query with the simplest possible candidate query (delegate + permission only, no `FILTER`/`FILTER NOT EXISTS`/`VALUES` beyond the plain join -- confirmed safe in every shape tried) plus validity-window, revocation, delegator-status and target/delegator narrowing in Python. Verified against the real running service, not just SPARQL in isolation: an unprivileged write attempt now returns a clean `403` instead of a `500`; a real delegation inserted the same shape the `/delegation` route produces lets the write through with correct attribution (`"delegated write from <delegator>"`). Full test suite unchanged (91 delegation tests passing; two pre-existing unrelated failure clusters confirmed present before this change too, not caused by it). [PR #43](https://github.com/kurtcagle/holon-bridge-python/pull/43)
 
 ### 2026-09-30
 
@@ -371,4 +375,10 @@ hb:release-2026-09-30-k a hb:ReleaseNote ;
     rdfs:label "Fluent updates: a transition is confirmed by its own ledger entry; mint exhaustion is a 409" ;
     dcterms:description "update_fluent confirmed a transition by comparing the scene graph's current assertion with its own, which failed for list-mode fluents (they never have one, so every ListInsert/ListRemove looped to the attempt limit writing 8 ledger entries, then raised), made a winner retry and re-apply its operation when a third writer landed before its read-back (an Insert delta counted twice), and could report someone else's value as newValue. Since PR 41 a transition's ledger entry exists exactly when it fired, so confirmation now asks the ledger for the transition's own entry. A ListRemove of a non-member is refused up front before an id is minted, and POST /fluent/update now maps SequenceError to a 409 like /sequence/mint instead of a bare 500. Tested against rdflib's SPARQL engine, not Jena: 8 of 9 new tests fail on the previous code." ;
     rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/42> .
+
+hb:release-2026-10-04-a a hb:ReleaseNote ;
+    dcterms:date "2026-10-04"^^xsd:date ;
+    rdfs:label "find_delegation: fixed a Jena ARQ crash on the common zero-delegations case" ;
+    dcterms:description "find_delegation 500'd against real Fuseki with ARQInternalErrorException: Peek iterator is already empty, on any dataset with no matching Delegation triples for the bound pattern -- the common case, hit via check_write/authorize_query for any identity with no grantsWrite. The rdflib test harness in tests/test_delegation*.py cannot see this; it's a Jena ARQ optimizer bug. Three independent SPARQL-level rewrites (merging two FILTER NOT EXISTS into one via UNION, merging delegatedGraph into the main predicate chain, VALUES instead of a FILTER equality on ?delegator) each fixed their own isolated case live against Fuseki but still crashed combined -- none composed. Fixed by replacing the one correlated query with the simplest possible candidate query (delegate + permission only) plus validity-window, revocation, delegator-status and target/delegator narrowing in Python instead of SPARQL. Verified against the real running service: an unprivileged write now returns a clean 403, not a 500; a real delegation lets the write through with correct attribution. Full test suite unchanged." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/43> .
 ```

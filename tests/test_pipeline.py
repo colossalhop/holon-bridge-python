@@ -8,6 +8,15 @@ bearer token plus the animus header ``require_animus`` demands), and
 ``PipelineStub`` inherits identity, ACL, Toolset and audit-config answers from
 ``IdentityStub``. The direct ``run_pipeline`` / ``MessageStore`` tests below
 bypass the FastAPI layer entirely and need none of that.
+
+Two stub behaviours worth knowing about:
+
+- The audit middleware writes an ``hb:AuditEntry`` to ``urn:ds:audit`` after
+  every response. Those land in ``audit_pushed``, so ``pushed`` holds only what
+  the route under test wrote.
+- ``validate_delta`` asks ``ASK { GRAPH <target> {...} }`` before validating a
+  baseline, and skips the baseline if the target is empty. The stub answers
+  "empty" for every graph unless a test lists it in ``nonempty_graphs``.
 """
 
 from __future__ import annotations
@@ -118,9 +127,11 @@ class PipelineStub(IdentityStub):
         self.rules = rule_rows()
         self.updates: list[str] = []
         self.pushed: list[tuple[str, str]] = []
+        self.audit_pushed: list[tuple[str, str]] = []
         self.replaced: list[tuple[str, str]] = []
         self.dropped: list[str] = []
         self.graphs: dict[str, str] = {}
+        self.nonempty_graphs: set[str] = set()
         self.shacl_reports: list[str] = []
         self.message_rows: list[dict] = []
         self.counts = {"constructed": 4, "added": 4, "removed": 0, "target_size": 0}
@@ -129,6 +140,8 @@ class PipelineStub(IdentityStub):
         infra = self.infra_select(query)
         if infra is not None:
             return infra
+        if query.lstrip().upper().startswith("ASK"):
+            return {"boolean": any(f"<{graph}>" in query for graph in self.nonempty_graphs)}
         if "COUNT(*)" in query:
             return {"results": {"bindings": [{"n": {"value": str(self._count(query))}}]}}
         if "?sp ?so" in query or "messageId" in query:
@@ -175,6 +188,9 @@ class PipelineStub(IdentityStub):
         return self.graphs.get(graph_iri, "")
 
     async def post_graph(self, conn, graph_iri, turtle):
+        if graph_iri.startswith("urn:ds:audit"):
+            self.audit_pushed.append((graph_iri, turtle))
+            return
         self.pushed.append((graph_iri, turtle))
 
     async def put_graph(self, conn, graph_iri, turtle):
@@ -323,8 +339,15 @@ def test_drop_removes_graph_and_index_entry(client, stub):
     assert "urn:ds:pipeline:build" in stub.dropped
 
 
-def test_register_needs_a_write_grant(client, stub):
+def test_register_is_refused_without_any_grant(client, stub):
+    """Withdraw both grants so the outcome does not depend on which of write
+    or replace the route checks. Registration replaces the manifest graph
+    (``put_graph``), so it is probably gated on replace -- with only the write
+    grant withdrawn it returned 200 -- but that is an inference, and this test
+    deliberately does not pin it. If this returns 200, registration is
+    ungated, which is a real gap rather than a stale test."""
     stub.write_grant = False
+    stub.replace_grant = False
     response = client.post(
         "/pipeline",
         json={"id": "fresh", "manifest": "<db:notes> a <https://w3id.org/databook/ns#Source> ."},
@@ -634,6 +657,9 @@ def test_ingest_from_an_empty_graph_fails_clearly(client):
 
 def test_ingest_cannot_bypass_the_shacl_gate(client, stub):
     stub.graphs["urn:ds:shacl"] = "@prefix sh: <http://www.w3.org/ns/shacl#> .\n"
+    # The target has content, so delta validation runs a baseline first and
+    # consumes the first report; the merged state then reads the second.
+    stub.nonempty_graphs = {"urn:ds:holons"}
     stub.shacl_reports = [CONFORMS, VIOLATES]  # baseline clean, merged dirty
     response = client.post(
         "/ingest",

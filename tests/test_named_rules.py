@@ -10,6 +10,10 @@ Identity, ACL, Toolset and audit-config answers come from ``IdentityStub`` in
 write routes on ``check_write`` / ``check_replace``), so a bearer token alone
 gets a 401; ``auth()`` adds the animus header and the stub resolves it to an
 ordinary non-admin founder holding write and replace grants.
+
+The audit middleware writes an ``hb:AuditEntry`` to ``urn:ds:audit`` after
+every response. The stub files those in ``audit_pushed`` so ``pushed`` holds
+only what the rule under test wrote.
 """
 
 from __future__ import annotations
@@ -153,6 +157,7 @@ class RuleStub(IdentityStub):
         self.updates: list[str] = []
         self.constructed: list[str] = []
         self.pushed: list[tuple[str, str]] = []
+        self.audit_pushed: list[tuple[str, str]] = []
         self.dropped: list[str] = []
         self.counts = {"constructed": 7, "added": 3, "removed": 2, "target_size": 5}
         self.construct_error: Exception | None = None
@@ -191,6 +196,9 @@ class RuleStub(IdentityStub):
         return ""
 
     async def post_graph(self, conn, graph_iri, turtle):
+        if graph_iri.startswith("urn:ds:audit"):
+            self.audit_pushed.append((graph_iri, turtle))
+            return
         self.pushed.append((graph_iri, turtle))
 
     async def put_graph(self, conn, graph_iri, turtle):
@@ -211,6 +219,21 @@ class RuleStub(IdentityStub):
     # helpers
     def updates_matching(self, keyword: str) -> list[str]:
         return [u for u in self.updates if u.upper().startswith(keyword.upper())]
+
+    def atomic_replacements_of(self, target: str) -> list[str]:
+        """Updates that drop ``target`` and add into it within one request.
+
+        Replace mode used to be ``COPY SILENT``. It is now a single request
+        containing both steps, so a reader can never see the target emptied
+        between a DROP and an ADD.
+        """
+        found = []
+        for update in self.updates:
+            upper = update.upper()
+            if target in update and "DROP" in upper and "ADD" in upper:
+                if upper.index("DROP") < upper.index("ADD"):
+                    found.append(update)
+        return found
 
 
 @pytest.fixture
@@ -296,7 +319,10 @@ def test_non_construct_body_is_refused(client, stub):
 def test_append_adds_without_removing(client, stub):
     body = run(client, "append-derived").json()
     assert body["writeMode"] == "Append"
-    assert body["triplesWritten"] == 7
+    # ``triplesWritten`` counts triples actually new to the target (the stub
+    # constructs 7, of which 3 are not already there), not triples constructed.
+    # That changed with the Replace write-count fix; it used to report 7.
+    assert body["triplesWritten"] == 3
     assert body["triplesAdded"] == 3
     assert body["triplesRemoved"] == 0
     assert stub.updates_matching("ADD SILENT")
@@ -304,12 +330,14 @@ def test_append_adds_without_removing(client, stub):
     assert not stub.updates_matching("COPY")
 
 
-def test_replace_copies_over_the_target(client, stub):
+def test_replace_swaps_the_target_in_one_request(client, stub):
     body = run(client, "replace-snapshot").json()
     assert body["writeMode"] == "Replace"
     assert body["triplesRemoved"] == 5  # whatever the target held
-    copies = stub.updates_matching("COPY SILENT")
-    assert copies and copies[0].endswith("TO <urn:ds:snapshot>")
+    # One request that drops the target and adds the scratch graph into it,
+    # not a COPY and not two round trips another writer could slip between.
+    assert len(stub.atomic_replacements_of("urn:ds:snapshot")) == 1
+    assert not stub.updates_matching("COPY SILENT")
 
 
 def test_sync_deletes_stale_then_inserts_new(client, stub):
@@ -329,7 +357,7 @@ def test_sync_deletes_stale_then_inserts_new(client, stub):
 def test_write_mode_can_be_overridden_per_run(client, stub):
     body = run(client, "append-derived", write_mode="Replace").json()
     assert body["writeMode"] == "Replace"
-    assert stub.updates_matching("COPY SILENT")
+    assert len(stub.atomic_replacements_of("urn:ds:derived")) == 1
 
 
 def test_construct_output_never_goes_through_a_local_parser(client, stub):

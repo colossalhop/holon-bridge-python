@@ -3,6 +3,11 @@
 The registry is served from a stub that routes on query shape, so loading,
 vocabulary detection, and both binding strategies are exercised end to end
 without a Fuseki.
+
+Identity, ACL, Toolset and audit-config answers come from ``IdentityStub`` in
+``tests/_identity.py``: every route here depends on ``require_animus``, so a
+bearer token alone gets a 401. ``stub.executed`` records only the user's query
+(recognised by the markers below), not the bridge's incidental reads.
 """
 
 from __future__ import annotations
@@ -15,7 +20,8 @@ from holonbridge.params import ParameterError, render_term, values_clause
 from holonbridge.server import create_app
 from holonbridge.sparql_kind import accepts_values_clause, classify, form
 
-TOKEN = "test-token"
+from ._identity import TOKEN, IdentityStub, auth
+from ._identity import row as _row
 
 HB_TYPE = "https://w3id.org/holonbridge/NamedQuery"
 HQ_TYPE = "https://w3id.org/holon/query/NamedQuery"
@@ -33,9 +39,8 @@ HQ_BODY = (
     "}\nORDER BY ?child\nLIMIT 50"
 )
 
-
-def _row(**cells: str) -> dict:
-    return {key: {"value": value} for key, value in cells.items()}
+# Predicates that appear only in the two registered query bodies above.
+USER_QUERY_MARKERS = ("<urn:onTeam>", "<urn:label>")
 
 
 def registry_rows() -> list[dict]:
@@ -70,24 +75,29 @@ def param_rows() -> list[dict]:
     ]
 
 
-class RegistryStub:
-    """Serves the registry, and records whatever query is executed after it."""
+class RegistryStub(IdentityStub):
+    """Serves the registry, and records whatever user query is executed after it."""
 
     def __init__(self) -> None:
+        super().__init__()
         self.registry = registry_rows()
         self.params = param_rows()
         self.executed: list[str] = []
         self.updates: list[str] = []
 
     async def select(self, conn, query, *, default_graph=None):
+        infra = self.infra_select(query)
+        if infra is not None:
+            return infra
         if "?link" in query:
             return {"results": {"bindings": self.params}}
         if "NamedQuery" in query:
             return {"results": {"bindings": self.registry}}
-        self.executed.append(query)
+        if any(marker in query for marker in USER_QUERY_MARKERS):
+            self.executed.append(query)
         return {"results": {"bindings": []}}
 
-    async def construct(self, conn, query, *, default_graph=None):
+    async def construct(self, conn, query, *, default_graph=None, timeout=None):
         self.executed.append(query)
         return "# constructed\n"
 
@@ -129,10 +139,6 @@ def client(stub: RegistryStub):
         yield test_client
 
 
-def auth() -> dict[str, str]:
-    return {"Authorization": f"Bearer {TOKEN}"}
-
-
 # --- loading ------------------------------------------------------------------
 
 
@@ -159,9 +165,13 @@ def test_parameters_load_with_their_declared_datatypes(client):
 
 
 def test_registry_read_failure_degrades_to_empty(client, stub):
-    async def boom(conn, query, *, default_graph=None):
-        from holonbridge.fuseki import FusekiError
+    from holonbridge.fuseki import FusekiError
 
+    async def boom(conn, query, *, default_graph=None):
+        # Identity and ACL reads must still work -- only the registry is down.
+        infra = stub.infra_select(query)
+        if infra is not None:
+            return infra
         raise FusekiError(503, "backend down")
 
     stub.select = boom  # type: ignore[method-assign]

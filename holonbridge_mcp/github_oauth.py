@@ -284,8 +284,20 @@ async def metadata(request: Request) -> JSONResponse:
 
 
 async def protected_resource_metadata(request: Request) -> JSONResponse:
+    """RFC 9728 protected-resource metadata.
+
+    ``resource`` must be the resource identifier the well-known URL was derived
+    from (RFC 9728 §3.3): for ``/.well-known/oauth-protected-resource/mcp`` that
+    is ``<public>/mcp``, not the bare origin. A client that validates this --
+    a new Streamable HTTP connector may -- rejects the bare origin there.
+
+    The bare and ``/sse``-suffixed variants keep returning the bare origin
+    exactly as before: a connector registered against ``/sse`` works with it
+    today, and changing what it sees would risk breaking something that works.
+    """
     base = _base(request)
-    return JSONResponse({"resource": base, "authorization_servers": [base]})
+    resource = f"{base}/mcp" if request.url.path.rstrip("/").endswith("/mcp") else base
+    return JSONResponse({"resource": resource, "authorization_servers": [base]})
 
 
 async def register(request: Request) -> JSONResponse:
@@ -524,8 +536,9 @@ def build_routes() -> list[Route]:
     return [
         Route("/.well-known/oauth-authorization-server", metadata, methods=["GET"]),
         Route("/.well-known/oauth-protected-resource", protected_resource_metadata, methods=["GET"]),
-        # Same handler, same content — the suffix is only where the client
-        # looked, per RFC 9728 §3.1, not a different resource description.
+        # The suffix is where the client looked, per RFC 9728 §3.1. The handler
+        # answers with the matching resource identifier for /mcp and the bare
+        # origin otherwise -- see protected_resource_metadata.
         Route(
             "/.well-known/oauth-protected-resource/sse",
             protected_resource_metadata,

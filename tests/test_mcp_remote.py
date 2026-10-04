@@ -4,6 +4,11 @@ The one regression this guards hardest against is the exact bug hit on the
 Node side: an OAuth well-known/register/authorize/token path landing behind
 the auth gate, because the metadata endpoint that is supposed to bootstrap
 the whole flow would then itself require a credential nobody has yet.
+
+Transport coverage: ``sse`` (``/sse``), ``http`` (``/mcp``) and ``both``. These
+tests use ``FakeMcp``, which stands in for FastMCP; the real SDK, including
+how identity survives Streamable HTTP, is exercised in
+``test_mcp_streamable_identity.py``.
 """
 
 from __future__ import annotations
@@ -20,19 +25,28 @@ from holonbridge_mcp import remote, session
 
 
 class FakeMcp:
-    """Stands in for FastMCP: returns a tiny Starlette app as the transport."""
+    """Stands in for FastMCP: each transport is a tiny Starlette app.
+
+    The two answer with different bodies so a test can tell which transport
+    actually served a request. Like the real SSE and Streamable HTTP apps they
+    own different paths (``/sse`` and ``/mcp``).
+    """
 
     def __init__(self) -> None:
-        async def handle(request: Request) -> PlainTextResponse:
+        async def handle_sse(request: Request) -> PlainTextResponse:
             return PlainTextResponse("mcp-transport-reached")
 
-        self._app = Starlette(routes=[Route("/sse", handle, methods=["GET"])])
+        async def handle_http(request: Request) -> PlainTextResponse:
+            return PlainTextResponse("mcp-http-transport-reached")
+
+        self._sse = Starlette(routes=[Route("/sse", handle_sse, methods=["GET"])])
+        self._http = Starlette(routes=[Route("/mcp", handle_http, methods=["GET", "POST"])])
 
     def sse_app(self):
-        return self._app
+        return self._sse
 
     def streamable_http_app(self):
-        return self._app
+        return self._http
 
 
 @pytest.fixture(autouse=True)
@@ -58,6 +72,12 @@ def auth(token: str) -> dict[str, str]:
 def test_refuses_to_start_with_no_credential_configured():
     with pytest.raises(SystemExit, match="No inbound credential"):
         remote.build_app(FakeMcp(), "sse")
+
+
+def test_refuses_to_start_with_no_credential_on_every_transport():
+    for transport in ("http", "streamable-http", "both"):
+        with pytest.raises(SystemExit, match="No inbound credential"):
+            remote.build_app(FakeMcp(), transport)
 
 
 def test_refuses_a_short_static_token(monkeypatch):
@@ -109,6 +129,7 @@ def test_static_token_mode_still_exempts_oauth_discovery_paths(monkeypatch):
         "/.well-known/oauth-authorization-server",
         "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-protected-resource/sse",
+        "/.well-known/oauth-protected-resource/mcp",
         "/register",
         "/authorize",
     ):
@@ -117,6 +138,85 @@ def test_static_token_mode_still_exempts_oauth_discovery_paths(monkeypatch):
 
     # The actual transport path is unaffected — still gated as before.
     assert client.get("/sse").status_code == 401
+
+
+# --- Streamable HTTP (/mcp) and both transports together ---------------------------
+
+
+@pytest.mark.parametrize("transport", ["http", "streamable-http"])
+def test_http_transport_serves_mcp_behind_the_same_gate(monkeypatch, transport):
+    monkeypatch.setenv("MCP_INBOUND_TOKEN", "x" * 32)
+    client = TestClient(remote.build_app(FakeMcp(), transport))
+
+    assert client.get("/healthz").status_code == 200
+    assert client.get("/mcp").status_code == 401
+    response = client.get("/mcp", headers=auth("x" * 32))
+    assert response.status_code == 200
+    assert response.text == "mcp-http-transport-reached"
+    # the legacy endpoint is not served when only Streamable HTTP was asked for
+    assert client.get("/sse", headers=auth("x" * 32)).status_code == 404
+
+
+def test_both_transports_serve_both_paths_behind_one_gate(monkeypatch):
+    monkeypatch.setenv("MCP_INBOUND_TOKEN", "x" * 32)
+    client = TestClient(remote.build_app(FakeMcp(), "both"))
+
+    assert client.get("/healthz").status_code == 200
+
+    # neither endpoint answers without a credential
+    assert client.get("/sse").status_code == 401
+    assert client.get("/mcp").status_code == 401
+    assert client.get("/mcp", headers=auth("wrong" * 8)).status_code == 401
+
+    # each is served by its own transport once authenticated
+    sse = client.get("/sse", headers=auth("x" * 32))
+    assert (sse.status_code, sse.text) == (200, "mcp-transport-reached")
+    http = client.get("/mcp", headers=auth("x" * 32))
+    assert (http.status_code, http.text) == (200, "mcp-http-transport-reached")
+
+
+def test_both_transports_share_the_oauth_layer(monkeypatch):
+    """One OAuth authorization server fronts both endpoints: the same issued
+    token works on /sse and /mcp, and discovery is open for either path."""
+    _enable_oauth(monkeypatch)
+    client = TestClient(remote.build_app(FakeMcp(), "both"), follow_redirects=False)
+
+    for path in (
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/sse",
+        "/.well-known/oauth-protected-resource/mcp",
+    ):
+        assert client.get(path).status_code == 200, f"{path} must not require auth"
+
+    config = oauth.config_from_env()
+    token, _ = oauth.issue_session_token(config, "kurtcagle")
+    assert client.get("/sse", headers=auth(token)).status_code == 200
+    assert client.get("/mcp", headers=auth(token)).status_code == 200
+    assert client.get("/mcp").status_code == 401
+
+
+class _SettingsDouble:
+    stateless_http = False
+
+
+def test_streamable_http_is_made_stateless(monkeypatch):
+    """Identity is per task, and only stateless mode starts that task from the
+    request being served -- see remote._require_stateless."""
+    monkeypatch.setenv("MCP_INBOUND_TOKEN", "x" * 32)
+    for transport in ("http", "streamable-http", "both"):
+        fake = FakeMcp()
+        fake.settings = _SettingsDouble()
+        remote.build_app(fake, transport)
+        assert fake.settings.stateless_http is True, transport
+
+
+def test_sse_alone_leaves_the_stateless_setting_alone(monkeypatch):
+    monkeypatch.setenv("MCP_INBOUND_TOKEN", "x" * 32)
+    fake = FakeMcp()
+    fake.settings = _SettingsDouble()
+    remote.build_app(fake, "sse")
+    assert fake.settings.stateless_http is False
 
 
 # --- GitHub OAuth mode ------------------------------------------------------------

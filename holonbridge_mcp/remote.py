@@ -27,6 +27,24 @@ login was checked and immediately discarded — correct for gating this
 transport, useless for anything downstream that needed to know who was
 asking. See ``identity.py`` for why a ContextVar is the right mechanism
 here and what it does and doesn't guarantee about session lifetime.
+
+CHANGED 2026-10-04: added the ``both`` transport. The legacy HTTP+SSE
+transport (``/sse`` and ``/messages/``) is deprecated in the MCP spec, and
+Claude's documentation says SSE support may be deprecated; Streamable HTTP
+(``/mcp``) is the replacement. ``both`` serves the two side by side from one
+process, behind the same gate, OAuth routes and tunnel, so existing
+connectors keep working while new ones move to ``/mcp``, and ``/sse`` can be
+dropped later by switching to ``http``.
+
+Whenever Streamable HTTP is served, the SDK is told to run it **stateless**
+(see :func:`_require_stateless`). The reason is identity: in the SDK's
+default stateful mode a session's server task is started from the request
+that created it, so every later request on that session would run as the
+*first* caller's login, whatever bearer token it presented. Stateless mode
+runs each request in its own task started from that request's context, which
+is the one ``BearerGate`` has just set. SSE is unaffected: it authenticates
+once per connection and keeps that identity for the connection's life, as
+before.
 """
 
 from __future__ import annotations
@@ -62,6 +80,18 @@ HEALTH_PATH = "/healthz"
 #: canned health stub" here was a real bug during development: it made every
 #: OAuth endpoint return `{"ok":true}` instead of running its handler.
 BASE_OPEN_PATHS: tuple[str, ...] = ()
+
+#: Every transport name ``build_app`` accepts. ``http`` and ``streamable-http``
+#: are the same thing; ``both`` is SSE and Streamable HTTP together.
+REMOTE_TRANSPORTS: tuple[str, ...] = ("sse", "http", "streamable-http", "both")
+
+#: Where each transport answers, for the startup log line.
+_TRANSPORT_PATHS: dict[str, str] = {
+    "sse": "/sse",
+    "http": "/mcp",
+    "streamable-http": "/mcp",
+    "both": "/sse (legacy) and /mcp",
+}
 
 
 class _RejectedType:
@@ -199,22 +229,44 @@ def _github_oauth_checker(oauth_config) -> Checker:  # noqa: ANN001
     return check
 
 
+def _require_stateless(mcp) -> None:  # noqa: ANN001 - FastMCP instance
+    """Tell the SDK to serve Streamable HTTP without sessions.
+
+    Must run before ``mcp.streamable_http_app()``, which reads the setting once
+    when it builds the session manager. See the module docstring for why:
+    identity is captured per task, and only stateless mode starts that task
+    from the request being served. Tolerates an object with no ``settings``
+    (the test double), where there is nothing to configure.
+    """
+    settings = getattr(mcp, "settings", None)
+    if settings is not None:
+        settings.stateless_http = True
+
+
 def build_app(mcp, transport: str):  # noqa: ANN001 - FastMCP instance
     """Assemble the ASGI app for a remote transport.
 
     Composition, not just gating: when GitHub OAuth is configured, its routes
     (metadata, registration, authorize, callback, token) are mounted at fixed
-    paths ahead of the MCP transport's own catch-all, and those exact paths
-    are added to the gate's open list. The MCP transport itself — matched
-    only by the trailing catch-all ``Mount`` — still requires a valid bearer
-    credential, static or OAuth-issued.
+    paths ahead of the MCP transport's own routes, and those exact paths
+    are added to the gate's open list. The MCP transport itself still
+    requires a valid bearer credential, static or OAuth-issued.
+
+    ``transport`` is one of :data:`REMOTE_TRANSPORTS`. ``both`` mounts the SSE
+    app's routes (``/sse``, ``/messages/``) and the Streamable HTTP app's route
+    (``/mcp``) side by side. They cannot each be a catch-all ``Mount("/")``:
+    the first would match every path and the second would never be reached,
+    so for ``both`` the routes themselves are merged.
     """
-    if transport == "sse":
-        transport_app = mcp.sse_app()
-    elif transport in {"http", "streamable-http"}:
-        transport_app = mcp.streamable_http_app()
-    else:
+    if transport not in REMOTE_TRANSPORTS:
         raise ValueError(f"{transport!r} is not a remote transport")
+
+    transport_apps = []
+    if transport in {"sse", "both"}:
+        transport_apps.append(mcp.sse_app())
+    if transport in {"http", "streamable-http", "both"}:
+        _require_stateless(mcp)
+        transport_apps.append(mcp.streamable_http_app())
 
     static_token = os.getenv("MCP_INBOUND_TOKEN", "").strip()
     if static_token and len(static_token) < 24:
@@ -263,16 +315,23 @@ def build_app(mcp, transport: str):  # noqa: ANN001 - FastMCP instance
             "GitHub OAuth enabled — allowed logins: %s",
             ", ".join(sorted(oauth_config.allowed_logins)),
         )
-    routes.append(Mount("/", app=transport_app))
 
-    # transport_app carries its own lifespan (mcp.streamable_http_app() sets
-    # `lifespan=lambda app: self.session_manager.run()` internally) -- a bare
-    # Mount() does not propagate a sub-app's lifespan to its parent, so
-    # without this the StreamableHTTPSessionManager's run() never starts and
-    # every request past the gate fails with "Task group is not initialized.
-    # Make sure to use run()." SSE never hit this: mcp.sse_app() doesn't use
-    # the same session-manager/task-group pattern.
-    app = Starlette(routes=routes, lifespan=transport_app.router.lifespan_context)
+    if len(transport_apps) == 1:
+        routes.append(Mount("/", app=transport_apps[0]))
+    else:
+        for transport_app in transport_apps:
+            routes.extend(transport_app.routes)
+
+    # The Streamable HTTP app is always last when it is served, and it is the
+    # one whose lifespan matters: mcp.streamable_http_app() sets
+    # `lifespan=lambda app: self.session_manager.run()` internally -- a bare
+    # Mount() (or merged routes) does not propagate a sub-app's lifespan to its
+    # parent, so without this the StreamableHTTPSessionManager's run() never
+    # starts and every request past the gate fails with "Task group is not
+    # initialized. Make sure to use run()." SSE never hit this: mcp.sse_app()
+    # doesn't use the same session-manager/task-group pattern.
+    lifespan_app = transport_apps[-1]
+    app = Starlette(routes=routes, lifespan=lifespan_app.router.lifespan_context)
     if oauth_config is not None:
         app.state.github_oauth_config = oauth_config
         app.state.oauth_state = github_oauth.OAuthState()
@@ -285,6 +344,11 @@ def serve(mcp, *, transport: str, host: str, port: int) -> None:  # noqa: ANN001
     import uvicorn
 
     app = build_app(mcp, transport)
-    path = "/sse" if transport == "sse" else "/mcp"
-    log.info("holonbridge-mcp listening on http://%s:%d%s (%s)", host, port, path, transport)
+    log.info(
+        "holonbridge-mcp listening on http://%s:%d%s (%s)",
+        host,
+        port,
+        _TRANSPORT_PATHS[transport],
+        transport,
+    )
     uvicorn.run(app, host=host, port=port, log_level="info")

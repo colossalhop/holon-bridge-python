@@ -29,6 +29,11 @@ Knobs (set on the stub instance):
 With the defaults the caller is an ordinary non-admin founder who may append
 and replace, and nothing is Toolset-restricted -- the posture most route tests
 want. A test of a denial path flips one knob.
+
+A stub that wants a ``executed`` list of "what the backend ran for the user"
+should record only its own domain queries and constructs; do not record
+whatever ``infra_select`` declined, because the bridge issues incidental reads
+on every request and a catch-all recorder turns those into test noise.
 """
 
 from __future__ import annotations
@@ -41,10 +46,6 @@ PERSON_IRI = "urn:ds:person:kurt"
 PERSON_LABEL = "Kurt"
 
 ANIMUS_HEADERS = {"x-holon-animus-id": EXTERNAL_ID}
-
-# Substrings that mark a SELECT as the user-visible query a test is asserting
-# on, as opposed to registry or infrastructure traffic. Used by stubs whose
-# "what did the backend actually run" list must not pick up incidental reads.
 
 
 def row(**cells: str) -> dict:

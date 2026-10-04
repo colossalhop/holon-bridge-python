@@ -39,6 +39,15 @@
     -BootstrapAdminGithubUser unset (the default) means nothing changes
     here at all.
 
+    CHANGED 2026-10-04: the MCP transport is now the -McpTransport
+    parameter instead of a hard-coded "sse". The legacy HTTP+SSE transport
+    is deprecated in the MCP spec; "both" serves it at /sse and Streamable
+    HTTP at /mcp from the one process and tunnel, so existing connectors keep
+    working while new ones are added at /mcp. A hard-coded "--transport sse"
+    here silently overrode MCP_TRANSPORT and the .env, so a deployment that
+    was meant to serve /mcp came up SSE-only and every request to /mcp
+    404'd after authentication.
+
 .PARAMETER RepoPath
     Directory containing the holonbridge and holonbridge_mcp packages.
 
@@ -49,6 +58,12 @@
 .PARAMETER McpNgrokUrl
     Reserved ngrok hostname for the MCP server's tunnel. Defaults to the
     one seen in earlier session logs.
+
+.PARAMETER McpTransport
+    Which remote MCP transport to serve: "sse" (legacy, /sse), "http" (also
+    spelled "streamable-http"; Streamable HTTP, /mcp) or "both" (/sse and
+    /mcp together). Defaults to "both". Move to "http" once no connector
+    still points at /sse.
 
 .PARAMETER RestNgrokUrl
     Reserved ngrok hostname for the REST bridge's tunnel, if you actually
@@ -84,6 +99,9 @@
     .\start-holonbridge.ps1
 
 .EXAMPLE
+    .\start-holonbridge.ps1 -McpTransport sse
+
+.EXAMPLE
     .\start-holonbridge.ps1 -RestNgrokUrl "kurtcagle-rest-python.ngrok.io"
 
 .EXAMPLE
@@ -97,6 +115,8 @@ param(
     [string]$RestNgrokUrl  = "",
     [int]$RestPort         = 3031,
     [int]$McpPort          = 3034,
+    [ValidateSet("sse", "http", "streamable-http", "both")]
+    [string]$McpTransport  = "both",
 
     # Fuseki -- primary (holongraph bank). Runs bare, no arguments -- its
     # dataset and location are already defined in its own config files.
@@ -248,7 +268,10 @@ if (Test-Path $holonbridgeExe) {
 }
 Start-Sleep -Seconds 3   # give the REST bridge a moment to bind before the MCP layer starts calling it
 
-$handles += Start-Logged -Name "mcp" -FilePath $python -ArgumentList @("-m", "holonbridge_mcp", "--transport", "sse", "--port", "$McpPort")
+# The transport is a parameter, not a literal: a hard-coded "sse" here beat
+# MCP_TRANSPORT and the .env, so /mcp was never served. The MCP process logs
+# which paths it is answering at startup -- check the mcp .out/.err log.
+$handles += Start-Logged -Name "mcp" -FilePath $python -ArgumentList @("-m", "holonbridge_mcp", "--transport", $McpTransport, "--port", "$McpPort")
 
 $handles += Start-Logged -Name "ngrok-mcp" -FilePath "ngrok" -ArgumentList @("http", "--url=$McpNgrokUrl", "$McpPort")
 
@@ -261,6 +284,7 @@ if ($RestNgrokUrl) {
 Write-Host ""
 Write-Host "All processes started:" -ForegroundColor Green
 foreach ($h in $handles) { Write-Host ("  {0,-12} PID {1}" -f $h.Name, $h.Process.Id) }
+Write-Host "  MCP transport: $McpTransport"
 Write-Host ""
 Write-Host "Watching for crashes. Press Ctrl+C to stop everything cleanly."
 Write-Host ""

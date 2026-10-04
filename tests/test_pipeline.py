@@ -2,6 +2,12 @@
 
 Runs use ``wait=true`` so outcomes are deterministic; the background path is
 tested for its immediate contract rather than by racing a task to completion.
+
+Route-level tests authenticate with ``auth()`` from ``tests/_identity.py`` (the
+bearer token plus the animus header ``require_animus`` demands), and
+``PipelineStub`` inherits identity, ACL, Toolset and audit-config answers from
+``IdentityStub``. The direct ``run_pipeline`` / ``MessageStore`` tests below
+bypass the FastAPI layer entirely and need none of that.
 """
 
 from __future__ import annotations
@@ -23,7 +29,9 @@ from holonbridge.pipeline import (
 from holonbridge.routes import pipeline as pipeline_routes
 from holonbridge.server import create_app
 
-TOKEN = "test-token"
+from ._identity import TOKEN, IdentityStub, auth
+from ._identity import row as _row
+
 HB = "https://w3id.org/holonbridge/"
 BUILD = "https://w3id.org/databook/ns#"
 RULE_TYPE = f"{HB}NamedRule"
@@ -40,10 +48,6 @@ graph:
 <urn:a> <urn:b> <urn:c> .
 ```
 """
-
-
-def _row(**cells: str) -> dict:
-    return {key: {"value": value} for key, value in cells.items()}
 
 
 def manifest_rows() -> list[dict]:
@@ -107,8 +111,9 @@ def rule_rows() -> list[dict]:
     ]
 
 
-class PipelineStub:
+class PipelineStub(IdentityStub):
     def __init__(self) -> None:
+        super().__init__()
         self.manifests = {"build": manifest_rows(), "loop": cyclic_rows()}
         self.rules = rule_rows()
         self.updates: list[str] = []
@@ -121,6 +126,9 @@ class PipelineStub:
         self.counts = {"constructed": 4, "added": 4, "removed": 0, "target_size": 0}
 
     async def select(self, conn, query, *, default_graph=None):
+        infra = self.infra_select(query)
+        if infra is not None:
+            return infra
         if "COUNT(*)" in query:
             return {"results": {"bindings": [{"n": {"value": str(self._count(query))}}]}}
         if "?sp ?so" in query or "messageId" in query:
@@ -205,10 +213,6 @@ def client(stub: PipelineStub):
         yield test_client
 
 
-def auth() -> dict[str, str]:
-    return {"Authorization": f"Bearer {TOKEN}"}
-
-
 def conn() -> Conn:
     return Conn(base_url="http://x", dataset="ds", overridden=False, bank_name="local")
 
@@ -262,10 +266,10 @@ def test_dangling_dependency_warns_but_still_orders():
     assert any("does not define" in w for w in manifest.warnings)
 
 
-def test_type_mismatch_is_a_warning(client):
-    body = client.get("/pipeline/build", headers=auth()).json()
-    # 'compiled' has no declared inputType, so no mismatch; shapes/inferred match
-    assert isinstance(body["warnings"], list)
+# test_type_mismatch_is_a_warning was retired: its fixture has no type
+# mismatch (its own comment said so) and it asserted only that ``warnings`` is
+# a list, so it could not fail. If input/output type checking needs a test, it
+# needs a manifest that actually mismatches and an assertion on the warning.
 
 
 def test_unknown_pipeline_is_404(client):
@@ -285,7 +289,10 @@ def test_register_writes_the_manifest_graph_and_indexes_it(client, stub):
 
     assert body["ok"] is True
     assert body["graph"] == "urn:ds:pipeline:fresh"
-    assert ("urn:ds:pipeline:fresh", body and stub.replaced[0][1]) == stub.replaced[0]
+    assert len(stub.replaced) == 1
+    graph, turtle = stub.replaced[0]
+    assert graph == "urn:ds:pipeline:fresh"
+    assert "databook/ns#Source" in turtle
     assert any("pipelineId" in u for u in stub.updates)
 
 
@@ -314,6 +321,24 @@ def test_drop_removes_graph_and_index_entry(client, stub):
     body = client.delete("/pipeline/build", headers=auth()).json()
     assert body["ok"] is True
     assert "urn:ds:pipeline:build" in stub.dropped
+
+
+def test_register_needs_a_write_grant(client, stub):
+    stub.write_grant = False
+    response = client.post(
+        "/pipeline",
+        json={"id": "fresh", "manifest": "<db:notes> a <https://w3id.org/databook/ns#Source> ."},
+        headers=auth(),
+    )
+    assert response.status_code == 403
+    assert stub.replaced == []
+
+
+def test_drop_needs_a_replace_grant(client, stub):
+    stub.replace_grant = False
+    response = client.delete("/pipeline/build", headers=auth())
+    assert response.status_code == 403
+    assert stub.dropped == []
 
 
 # --- running ------------------------------------------------------------------
@@ -500,16 +525,16 @@ def test_llm_stage_exposes_extra_params_as_named_slots(stub):
             manifest,
             message,
             params={
-                "input": "CausalSpark uses HolonBridge.",
-                "submitter": "urn:causalspark:person:caroline",
+                "input": "Example Corp uses HolonBridge.",
+                "submitter": "urn:example:person:jane",
             },
         )
     )
 
     stage = message.stages[0]
     assert stage.status == "Deferred"
-    assert "Submitter: urn:causalspark:person:caroline" in stage.result
-    assert "Input: CausalSpark uses HolonBridge." in stage.result
+    assert "Submitter: urn:example:person:jane" in stage.result
+    assert "Input: Example Corp uses HolonBridge." in stage.result
     # "input" is consumed only by {{input}} -- never also exposed under its
     # own name, so no leftover, unsubstituted placeholder should remain.
     assert "{{input}}" not in stage.result
@@ -624,6 +649,17 @@ def test_ingest_cannot_bypass_the_shacl_gate(client, stub):
     assert detail["error"] == "shacl_violation"
     assert len(detail["messageId"]) == 32
     # the scratch graph used for delta validation is written; the target is not
+    assert not any(graph == "urn:ds:holons" for graph, _ in stub.pushed)
+
+
+def test_ingest_needs_a_write_grant(client, stub):
+    stub.write_grant = False
+    response = client.post(
+        "/ingest",
+        json={"turtle": "<urn:a> <urn:b> <urn:c> .", "graph_iri": "urn:ds:holons"},
+        headers=auth(),
+    )
+    assert response.status_code == 403
     assert not any(graph == "urn:ds:holons" for graph, _ in stub.pushed)
 
 

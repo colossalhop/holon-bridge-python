@@ -78,6 +78,44 @@ class Bank:
         }
 
 
+MIN_TOKEN_LENGTH = 24
+
+
+def parse_identity_tokens(raw: str | None) -> dict[str, str]:
+    """``IDENTITY_TOKENS="tokenA=login-a,tokenB=login-b"`` -> ``{tokenA: login-a, ...}``.
+
+    Fails closed at startup (ValueError) on anything ambiguous -- an empty
+    side, a short token, or the same token bound twice -- because a silently
+    skipped entry would leave a caller unauthenticated or, worse, bound to
+    the wrong identity.
+    """
+    out: dict[str, str] = {}
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        token, sep, identity = item.partition("=")
+        token, identity = token.strip(), identity.strip()
+        if not sep or not token or not identity:
+            raise ValueError("IDENTITY_TOKENS entries must look like token=identity")
+        if len(token) < MIN_TOKEN_LENGTH:
+            raise ValueError(f"IDENTITY_TOKENS: token for {identity!r} is shorter than {MIN_TOKEN_LENGTH} characters")
+        if token in out:
+            raise ValueError("IDENTITY_TOKENS: the same token is bound to more than one identity")
+        out[token] = identity
+    return out
+
+
+def parse_proxy_tokens(raw: str | None) -> tuple[str, ...]:
+    tokens = tuple(t.strip() for t in (raw or "").split(",") if t.strip())
+    for token in tokens:
+        if len(token) < MIN_TOKEN_LENGTH:
+            raise ValueError(f"PROXY_TOKENS: a token is shorter than {MIN_TOKEN_LENGTH} characters")
+    if len(set(tokens)) != len(tokens):
+        raise ValueError("PROXY_TOKENS: duplicate token")
+    return tokens
+
+
 @dataclass
 class Settings:
     """Process-level settings, all overridable by environment variable."""
@@ -87,6 +125,25 @@ class Settings:
     fuseki_url: str = "http://localhost:3030"
     fuseki_dataset: str = "ds"
     bearer_token: str | None = None
+
+    # Identity-bound credentials. ``bearer_token`` above is a SHARED token: whoever
+    # holds it can send any ``x-holon-animus-id`` and be that Person, admin
+    # included (the header is trusted, the token proves nothing about who is
+    # calling). These settings let a deployment replace it with credentials
+    # that do prove it:
+    #
+    #   identity_tokens -- token -> external id. A request bearing one of these
+    #     IS that identity; a conflicting animus header is refused, never
+    #     honoured. Give each service/person their own.
+    #   proxy_tokens    -- tokens held by a TRUSTED PROXY (e.g. the MCP remote,
+    #     which has itself verified the caller via OAuth). Only these may assert
+    #     an identity through the header, exactly as the shared token does today.
+    #   allow_legacy_bearer -- whether ``bearer_token`` is still accepted. True
+    #     by default so existing deployments are unchanged; set false once
+    #     every caller has moved to one of the two kinds above.
+    identity_tokens: dict[str, str] = field(default_factory=dict)
+    proxy_tokens: tuple[str, ...] = ()
+    allow_legacy_bearer: bool = True
 
     # Turtle handling. ``passthrough`` sends payloads to Jena unparsed, which
     # is the only safe mode for RDF 1.2 (rdflib cannot parse triple terms).
@@ -125,6 +182,20 @@ class Settings:
     # whether this process can see that host's disk.
     fuseki_config_dir: Path | None = None
 
+    def __post_init__(self) -> None:
+        # One token, one role. A token that is both the shared legacy token and
+        # an identity token (or a proxy token) would be ambiguous about whether
+        # the animus header may override it, so refuse to start.
+        seen: dict[str, str] = {}
+        for token, role in (
+            *( (t, "identity") for t in self.identity_tokens),
+            *( (t, "proxy") for t in self.proxy_tokens),
+            *( ((self.bearer_token, "legacy"),) if self.bearer_token else () ),
+        ):
+            if token in seen:
+                raise ValueError(f"the same token is configured as both {seen[token]} and {role}")
+            seen[token] = role
+
     @classmethod
     def from_env(cls) -> "Settings":
         def _flag(key: str, default: bool) -> bool:
@@ -141,6 +212,9 @@ class Settings:
             fuseki_url=os.getenv("FUSEKI_URL", "http://localhost:3030").rstrip("/"),
             fuseki_dataset=os.getenv("FUSEKI_DATASET", "ds"),
             bearer_token=os.getenv("BEARER_TOKEN") or None,
+            identity_tokens=parse_identity_tokens(os.getenv("IDENTITY_TOKENS")),
+            proxy_tokens=parse_proxy_tokens(os.getenv("PROXY_TOKENS")),
+            allow_legacy_bearer=_flag("ALLOW_LEGACY_BEARER", True),
             parse_mode=os.getenv("PARSE_MODE", "passthrough").strip().lower(),
             shacl_required=_flag("SHACL_REQUIRED", False),
             shacl_delta=_flag("SHACL_DELTA", True),

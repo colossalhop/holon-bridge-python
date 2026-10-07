@@ -36,6 +36,12 @@ override is active -- so any caller (route or MCP tool) that specifically
 needs the authenticated identity rather than the currently-acting-as one
 has a field to read instead of having to know about this store directly.
 
+CHANGED 2026-10-07: :func:`require_auth` now classifies the token
+(:class:`TokenAuth`) and :func:`require_animus` honours an identity-bound token:
+the credential, not the ``x-holon-animus-id`` header, decides who the caller is.
+The shared ``BEARER_TOKEN`` keeps its old meaning (any identity via the header)
+unless ``ALLOW_LEGACY_BEARER`` is turned off.
+
 CHANGED 2026-09-30 (audit): ``require_conn`` and ``require_animus`` also
 put the resolved ``Conn`` and ``Animus`` on ``request.state``, which is
 where ``holonbridge.audit.AuditMiddleware`` reads them after the response.
@@ -88,13 +94,58 @@ def get_acting_as(request: Request) -> ActingAsStore:
     return request.app.state.acting_as
 
 
+@dataclasses.dataclass(frozen=True)
+class TokenAuth:
+    """What the presented bearer token IS, as decided by :func:`require_auth`.
+
+    ``kind``:
+
+    - ``identity`` -- bound to ``identity``; the caller IS that identity and no
+      header can say otherwise.
+    - ``proxy`` -- held by a trusted proxy (the MCP remote, which has verified
+      the caller itself); may assert an identity via ``x-holon-animus-id``.
+    - ``legacy`` -- the shared ``BEARER_TOKEN``; may assert ANY identity via the
+      header, admin included. This is the pre-existing behaviour, kept so a
+      deployment can migrate; see ``allow_legacy_bearer`` to switch it off.
+    - ``open`` -- no token configured (loopback development only).
+    """
+
+    kind: str
+    identity: str | None = None
+
+
+def _match_token(presented: str, settings: Settings) -> TokenAuth | None:
+    """Compare against EVERY configured token with no early exit, so response
+    time does not reveal which kind (or how many) matched."""
+    given = presented.encode("utf-8")
+    found: TokenAuth | None = None
+    for token, identity in settings.identity_tokens.items():
+        if secrets.compare_digest(given, token.encode("utf-8")):
+            found = TokenAuth("identity", identity)
+    for token in settings.proxy_tokens:
+        if secrets.compare_digest(given, token.encode("utf-8")):
+            found = TokenAuth("proxy")
+    if settings.bearer_token and settings.allow_legacy_bearer:
+        if secrets.compare_digest(given, settings.bearer_token.encode("utf-8")):
+            found = TokenAuth("legacy")
+    return found
+
+
 def require_auth(
+    request: Request,
     settings: Annotated[Settings, Depends(get_settings_dep)],
     authorization: Annotated[str | None, Header()] = None,
-) -> None:
-    """Bearer check. Runs before anything touches the backend."""
-    expected = settings.bearer_token
-    if not expected:
+) -> TokenAuth:
+    """Bearer check. Runs before anything touches the backend.
+
+    Also classifies the token (:class:`TokenAuth`) and leaves the result on
+    ``request.state.token_auth`` for :func:`require_animus`, which is where an
+    identity-bound token actually takes effect.
+    """
+    configured = bool(
+        settings.bearer_token or settings.identity_tokens or settings.proxy_tokens
+    )
+    if not configured:
         # No token configured: local development only. Refuse to serve
         # anything if the process is listening on a non-loopback interface.
         if settings.host not in {"127.0.0.1", "localhost", "::1"}:
@@ -102,7 +153,9 @@ def require_auth(
                 status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="BEARER_TOKEN must be set when binding a public interface",
             )
-        return
+        result = TokenAuth("open")
+        request.state.token_auth = result
+        return result
 
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(
@@ -112,19 +165,24 @@ def require_auth(
         )
 
     presented = authorization.split(" ", 1)[1].strip()
-    if not secrets.compare_digest(presented, expected):
+    result = _match_token(presented, settings)
+    if result is None:
+        # Same message whether the token is unknown or is the legacy token on a
+        # deployment that has switched it off: do not say which.
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             detail="invalid bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    request.state.token_auth = result
+    return result
 
 
 def require_conn(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings_dep)],
     banks: Annotated[BankStore, Depends(get_banks)],
-    _: Annotated[None, Depends(require_auth)],
+    _: Annotated[TokenAuth, Depends(require_auth)],
 ) -> Conn:
     """Resolve the connection for this request."""
     override = request.headers.get(DATASET_OVERRIDE_HEADER)
@@ -173,13 +231,27 @@ async def require_animus(
     ``/admin/act-as``/``/admin/cease-acting-as`` routes themselves -- has
     it, unconditionally, on every returned ``Animus``.
     """
-    external_id = request.headers.get(ANIMUS_ID_HEADER)
-    if not external_id:
-        raise HTTPException(
-            status.HTTP_401_UNAUTHORIZED,
-            detail=f"missing {ANIMUS_ID_HEADER} header",
-        )
-    external_id_type = request.headers.get(ANIMUS_TYPE_HEADER, DEFAULT_ANIMUS_TYPE)
+    token_auth: TokenAuth = getattr(request.state, "token_auth", None) or TokenAuth("legacy")
+    header_id = request.headers.get(ANIMUS_ID_HEADER)
+    if token_auth.kind == "identity":
+        # The credential decides who this is; the header may only agree with it.
+        # Never honour a different one, and ignore the type header too -- else a
+        # holder could present the same string under another identity namespace.
+        if header_id and header_id != token_auth.identity:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail=f"this token is bound to a different identity than the {ANIMUS_ID_HEADER} header names",
+            )
+        external_id = token_auth.identity
+        external_id_type = DEFAULT_ANIMUS_TYPE
+    else:
+        external_id = header_id
+        if not external_id:
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED,
+                detail=f"missing {ANIMUS_ID_HEADER} header",
+            )
+        external_id_type = request.headers.get(ANIMUS_TYPE_HEADER, DEFAULT_ANIMUS_TYPE)
 
     async def query_fn(query: str) -> dict:
         return await client.select(conn, query)

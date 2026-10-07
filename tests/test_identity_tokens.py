@@ -24,7 +24,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from holonbridge.config import Settings, parse_identity_tokens, parse_proxy_tokens
-from holonbridge.deps import AnimusDep
+from holonbridge import audit
+from holonbridge.deps import AnimusDep, TokenAuth, require_auth, require_conn
 from holonbridge.server import create_app
 
 from ._identity import IdentityStub
@@ -308,3 +309,87 @@ def test_settings_read_the_new_variables_from_the_environment(monkeypatch):
 def test_legacy_stays_allowed_by_default(monkeypatch):
     monkeypatch.delenv("ALLOW_LEGACY_BEARER", raising=False)
     assert Settings.from_env().allow_legacy_bearer is True
+
+
+# --- a configuration that can authenticate nobody refuses to start -----------------
+
+
+def test_disabling_legacy_with_nothing_else_configured_refuses_to_start():
+    with pytest.raises(ValueError, match="no credential could ever authenticate"):
+        Settings(allow_legacy_bearer=False)
+    with pytest.raises(ValueError, match="no credential could ever authenticate"):
+        Settings(bearer_token=SHARED, allow_legacy_bearer=False)
+
+
+def test_disabling_legacy_is_fine_once_any_other_credential_exists():
+    Settings(identity_tokens={ALICE: ALICE_ID}, allow_legacy_bearer=False)
+    Settings(proxy_tokens=(PROXY,), allow_legacy_bearer=False)
+
+
+def test_the_same_check_applies_when_read_from_the_environment(monkeypatch):
+    for var in ("BEARER_TOKEN", "IDENTITY_TOKENS", "PROXY_TOKENS"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ALLOW_LEGACY_BEARER", "false")
+    with pytest.raises(ValueError, match="no credential could ever authenticate"):
+        Settings.from_env()
+
+
+# --- there is no fail-open path in require_animus ----------------------------------
+
+
+def test_a_route_that_skips_require_conn_still_cannot_dodge_the_token_check():
+    """require_animus used to read the classification back from request state and
+    default to 'legacy' (the most permissive kind) when it was missing -- so any
+    wiring that bypassed require_auth silently trusted the header. It now depends
+    on require_auth itself."""
+    settings = Settings(bearer_token=SHARED)
+    app = create_app(settings)
+
+    @app.get("/_whoami")
+    async def whoami(animus: AnimusDep):
+        return {"person": animus.person}
+
+    stub = RecordingStub()
+    app.dependency_overrides[require_conn] = lambda: None  # bypass the conn dependency entirely
+    with TestClient(app) as client:
+        app.state.fuseki = stub
+        response = client.get("/_whoami", headers={"x-holon-animus-id": ADMIN_ID})
+    assert response.status_code == 401  # no bearer token: refused, not trusted
+    assert not stub.looked_up(ADMIN_ID)
+
+
+def test_an_unrecognised_classification_is_an_error_not_a_downgrade():
+    settings = Settings(bearer_token=SHARED)
+    app = create_app(settings)
+
+    @app.get("/_whoami")
+    async def whoami(animus: AnimusDep):
+        return {"person": animus.person}
+
+    stub = RecordingStub()
+    app.dependency_overrides[require_auth] = lambda: TokenAuth("bogus")
+    with TestClient(app) as client:
+        app.state.fuseki = stub
+        response = client.get("/_whoami", headers={"x-holon-animus-id": ADMIN_ID})
+    assert response.status_code == 500
+    assert not stub.looked_up(ADMIN_ID)
+
+
+# --- the audit log records which kind of credential was behind a call ---------------
+
+
+def test_refusals_are_audited_with_the_token_kind(monkeypatch, bound):
+    client, stub = bound
+    captured: list[dict] = []
+
+    async def fake_record(_client, _conn, entry):
+        captured.append(entry)
+
+    monkeypatch.setattr(audit, "record", fake_record)
+    # a bound token naming someone else: 403, kind 'identity'
+    client.get("/_whoami", headers=bearer(ALICE, **{"x-holon-animus-id": ADMIN_ID}))
+    # a proxy token with no identity to assert: 401, kind 'proxy'
+    client.get("/_whoami", headers=bearer(PROXY))
+    kinds = [(e["status"], e.get("token_kind")) for e in captured]
+    assert (403, "identity") in kinds
+    assert (401, "proxy") in kinds

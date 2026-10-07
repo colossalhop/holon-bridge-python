@@ -186,6 +186,13 @@ class Settings:
         # One token, one role. A token that is both the shared legacy token and
         # an identity token (or a proxy token) would be ambiguous about whether
         # the animus header may override it, so refuse to start.
+        if not self.allow_legacy_bearer and not (self.identity_tokens or self.proxy_tokens):
+            # Fails closed (every request would be a 401) but is certainly a
+            # mistake -- say so at startup rather than at the first request.
+            raise ValueError(
+                "ALLOW_LEGACY_BEARER=false but no IDENTITY_TOKENS or PROXY_TOKENS are "
+                "configured: no credential could ever authenticate"
+            )
         seen: dict[str, str] = {}
         for token, role in (
             *( (t, "identity") for t in self.identity_tokens),

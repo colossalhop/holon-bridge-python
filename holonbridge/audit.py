@@ -532,6 +532,13 @@ def build_entry(entry: dict[str, Any]) -> str:
         props.append(f"hb:realActor <{real}>")
     if entry.get("acting_as"):
         props.append('hb:actingAs "true"^^xsd:boolean')
+    # What kind of credential authenticated the call. This is the control that
+    # tells a BOUND identity ("identity": the token itself named the caller)
+    # from an ASSERTED one ("proxy" or "legacy": the caller said who they were
+    # in the x-holon-animus-id header). Absent on a request that never got as
+    # far as a recognised token (a plain 401).
+    if entry.get("token_kind"):
+        props.append(f"hb:tokenKind {_lit(entry['token_kind'])}")
     for graph in entry.get("graphs") or []:
         iri = _iri(graph)
         props.append(f"hb:targetGraph <{iri}>" if iri else f"hb:targetGraphText {_lit(graph)}")
@@ -639,6 +646,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
                 "actor": getattr(animus, "person", None),
                 "real_actor": getattr(animus, "real_person", None),
                 "acting_as": acting_as,
+                "token_kind": getattr(getattr(request.state, "token_auth", None), "kind", None),
                 "security_read": (not mutation) and security_read,
             }
             entry.update({k: v for k, v in ctx.items() if k != "security_read"})

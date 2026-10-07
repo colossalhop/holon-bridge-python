@@ -23,7 +23,7 @@ from holonbridge import audit
 from holonbridge import delegation as dg
 from holonbridge.acl import Animus, authorize_query, check_replace, check_write
 from holonbridge.conn import Conn
-from holonbridge.deps import AnimusDep, ClientDep, ConnDep, get_client, require_animus, require_conn
+from holonbridge.deps import AnimusDep, ClientDep, ConnDep, get_client, require_animus, require_conn, TokenAuth
 from holonbridge.ingest import write_turtle_to_graph
 from holonbridge.routes import audit as audit_routes
 
@@ -112,6 +112,7 @@ def entries(stub):
                 "bytes": int(one(HB.payloadBytes)) if one(HB.payloadBytes) else None,
                 "security": bool(one(HB.securityRead)),
                 "note": str(one(HB.reason)) if one(HB.reason) else None,
+                "token_kind": str(one(HB.tokenKind)) if one(HB.tokenKind) else None,
             }
         )
     return sorted(out, key=lambda x: x["at"])
@@ -152,6 +153,10 @@ def client(stub, conn, actor):
 
     def _conn(request: Request) -> Conn:
         request.state.conn = conn
+        # What require_auth leaves behind for the middleware. Left unset unless a
+        # test asks for it, so entries carry no token kind by default.
+        if actor.get("token_kind"):
+            request.state.token_auth = TokenAuth(actor["token_kind"])
         return conn
 
     async def _animus(request: Request) -> Animus:
@@ -492,3 +497,51 @@ def test_setting_the_level_works_and_is_always_recorded(stub, client):
 
 def test_an_invalid_level_is_rejected(client):
     assert client.post("/audit/level", json={"level": "verbose"}).status_code == 400
+
+
+# --- the kind of credential that authenticated a call ----------------------------
+
+
+def test_an_entry_records_the_kind_of_credential_behind_it(stub, client, actor):
+    actor["token_kind"] = "identity"
+    assert push(client).status_code == 200
+    (e,) = entries(stub)
+    assert e["token_kind"] == "identity"
+
+
+def test_a_bound_identity_is_distinguishable_from_an_asserted_one(stub, client, actor):
+    """The point of recording it: 'identity' means the token itself named the
+    caller; 'proxy' and 'legacy' mean the caller said who they were in a header."""
+    for kind in ("identity", "proxy", "legacy"):
+        actor["token_kind"] = kind
+        push(client)
+    assert sorted(e["token_kind"] for e in entries(stub)) == ["identity", "legacy", "proxy"]
+
+
+def test_an_entry_with_no_recognised_token_carries_no_kind(stub, client):
+    assert push(client).status_code == 200
+    (e,) = entries(stub)
+    assert e["token_kind"] is None
+
+
+def test_the_listing_route_returns_the_token_kind(stub, client, actor):
+    actor["token_kind"] = "proxy"
+    push(client)
+    body = client.get("/audit").json()
+    assert [e["token_kind"] for e in body["entries"]] == ["proxy"]
+
+
+def test_build_entry_writes_the_kind_as_a_literal_that_cannot_alter_the_statement():
+    base = {"iri": "urn:example:e1", "at": datetime.now(timezone.utc), "outcome": "allowed",
+            "operation": "POST /x", "method": "POST", "path": "/x", "status": 200}
+    assert 'hb:tokenKind "identity"' in audit.build_entry({**base, "token_kind": "identity"})
+    assert "tokenKind" not in audit.build_entry(base)
+    # A hostile value must stay inside its literal: parse the statement and check
+    # its structure, rather than counting substrings (the text legitimately appears
+    # inside the escaped literal).
+    from rdflib import Graph, Literal
+    hostile = 'x" ; hb:outcome "forged'
+    g = Graph().parse(data=audit.build_entry({**base, "token_kind": hostile}), format="turtle")
+    subject = URIRef("urn:example:e1")
+    assert [str(o) for o in g.objects(subject, HB.outcome)] == ["allowed"]  # not forged
+    assert list(g.objects(subject, HB.tokenKind)) == [Literal(hostile)]

@@ -94,6 +94,10 @@ def get_acting_as(request: Request) -> ActingAsStore:
     return request.app.state.acting_as
 
 
+#: The only kinds :func:`require_auth` can produce. Anything else is a bug.
+TOKEN_KINDS = frozenset({"identity", "proxy", "legacy", "open"})
+
+
 @dataclasses.dataclass(frozen=True)
 class TokenAuth:
     """What the presented bearer token IS, as decided by :func:`require_auth`.
@@ -209,6 +213,7 @@ async def require_animus(
     conn: Annotated[Conn, Depends(require_conn)],
     client: Annotated[FusekiClient, Depends(get_client)],
     acting_as: Annotated[ActingAsStore, Depends(get_acting_as)],
+    token_auth: Annotated[TokenAuth, Depends(require_auth)],
 ) -> Animus:
     """Resolve the calling Person (and their Teams) for this request.
 
@@ -231,8 +236,17 @@ async def require_animus(
     ``/admin/act-as``/``/admin/cease-acting-as`` routes themselves -- has
     it, unconditionally, on every returned ``Animus``.
     """
-    token_auth: TokenAuth = getattr(request.state, "token_auth", None) or TokenAuth("legacy")
+    # ``token_auth`` is injected, not read back from request state with a default:
+    # a missing classification used to fall back to the most permissive kind
+    # ("legacy"), which fails OPEN. There is no such path now -- the dependency
+    # either classifies the token or the request is refused -- and an
+    # unrecognised kind is an error, never a quiet downgrade.
     header_id = request.headers.get(ANIMUS_ID_HEADER)
+    if token_auth.kind not in TOKEN_KINDS:
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"unrecognised token classification {token_auth.kind!r}",
+        )
     if token_auth.kind == "identity":
         # The credential decides who this is; the header may only agree with it.
         # Never honour a different one, and ignore the type header too -- else a

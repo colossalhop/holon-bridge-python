@@ -61,12 +61,20 @@ process:
   shared token keeps its old meaning until a deployment sets
   `ALLOW_LEGACY_BEARER=false`. Misconfiguration (a token in two roles, a
   token under 24 characters, a malformed pair) refuses to start. Tokens are
-  compared against every configured value with no early exit. 26 new tests
-  run the real app and assert which external id the bridge *looked up*; two
-  mutations of the fix (binding disabled, legacy flag ignored) each fail
-  them. Not covered here: recording the token kind in audit entries, and
-  per-token rotation or expiry (tokens are static config, like
-  `BEARER_TOKEN`).
+  compared against every configured value with no early exit. Review follow-ups
+  (same PR): `require_animus` now depends on `require_auth` itself, so there is
+  no "classification missing, assume legacy" fallback (an unrecognised kind is a
+  500, never a downgrade); `ALLOW_LEGACY_BEARER=false` with no identity or proxy
+  token configured refuses to start; and **every audit entry records the token
+  kind** (`hb:tokenKind`: `identity`, `proxy`, `legacy` or `open`), also returned
+  by `GET /audit` as `token_kind` -- that is the field that tells a bound
+  identity from one the caller merely asserted in the header. Bound tokens always
+  resolve as a `GitHubIdentity`, so a service account must exist in the dataset
+  as a Person with that identifier (documented in `.env.example`). The new tests
+  run the real app and assert which external id the bridge *looked up*; each
+  fix has a mutation (binding disabled, legacy flag ignored, fallback restored,
+  startup check removed, audit field dropped) that fails them. Not covered here:
+  per-token rotation or expiry (tokens are static config, like `BEARER_TOKEN`).
   [PR #51](https://github.com/kurtcagle/holon-bridge-python/pull/51)
 
 ### 2026-10-04

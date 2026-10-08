@@ -76,7 +76,7 @@ async def list_entries(
         filters.append(f'FILTER(?at >= "{dg._iso(since)}"^^<{audit.XSD}dateTime>)')
 
     query = f"""PREFIX hb: <{audit.HB}>
-SELECT ?e ?at ?actor ?realActor ?outcome ?operation ?status ?graph ?by ?reason ?note ?security ?hash
+SELECT ?e ?at ?actor ?realActor ?outcome ?operation ?status ?graph ?by ?reason ?note ?security ?hash ?tokenKind
 WHERE {{ GRAPH <{audit.audit_graph(conn.holons_graph)}> {{
   ?e a hb:AuditEntry ; hb:at ?at ; hb:outcome ?outcome ; hb:operation ?operation ; hb:status ?status .
   OPTIONAL {{ ?e hb:actor ?actor }}
@@ -87,6 +87,7 @@ WHERE {{ GRAPH <{audit.audit_graph(conn.holons_graph)}> {{
   OPTIONAL {{ ?e hb:reason ?note }}
   OPTIONAL {{ ?e hb:securityRead ?security }}
   OPTIONAL {{ ?e hb:payloadHash ?hash }}
+  OPTIONAL {{ ?e hb:tokenKind ?tokenKind }}
   {' '.join(filters)}
 }} }} ORDER BY DESC(?at) LIMIT {limit * 10}"""
 
@@ -115,6 +116,7 @@ WHERE {{ GRAPH <{audit.audit_graph(conn.holons_graph)}> {{
                 "note": row.get("note", {}).get("value"),
                 "security_read": "security" in row,
                 "payload_hash": row.get("hash", {}).get("value"),
+                "token_kind": row.get("tokenKind", {}).get("value"),
                 "graphs": [],
             }
         graph = row.get("graph", {}).get("value")

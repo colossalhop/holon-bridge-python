@@ -2,9 +2,9 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.10
+version: 1.0.11
 created: 2026-09-27
-updated: 2026-10-04
+updated: 2026-10-07
 author:
   - name: Kurt Cagle
     iri: https://holongraph.com/people/kurt-cagle
@@ -45,6 +45,37 @@ process:
    not needed yet.
 
 ## Log
+
+### 2026-10-07
+
+- **Security: identity-bound bearer tokens -- the credential, not a header, decides who the caller is.**
+  `require_animus` took the caller's identity from the `x-holon-animus-id`
+  header and the only credential was one shared `BEARER_TOKEN`, so whoever
+  held that token could send any identifier -- an admin's included -- and be
+  that Person. New settings: `IDENTITY_TOKENS`
+  (`token=identity` pairs; a request bearing one IS that identity and a header
+  naming anyone else is a 403, the type header is ignored), `PROXY_TOKENS`
+  (a trusted proxy such as the MCP remote may still assert the identity it has
+  verified via OAuth; point the MCP process's own `BEARER_TOKEN` at one), and
+  `ALLOW_LEGACY_BEARER` (default `true`). **No behaviour change on upgrade:** the
+  shared token keeps its old meaning until a deployment sets
+  `ALLOW_LEGACY_BEARER=false`. Misconfiguration (a token in two roles, a
+  token under 24 characters, a malformed pair) refuses to start. Tokens are
+  compared against every configured value with no early exit. Review follow-ups
+  (same PR): `require_animus` now depends on `require_auth` itself, so there is
+  no "classification missing, assume legacy" fallback (an unrecognised kind is a
+  500, never a downgrade); `ALLOW_LEGACY_BEARER=false` with no identity or proxy
+  token configured refuses to start; and **every audit entry records the token
+  kind** (`hb:tokenKind`: `identity`, `proxy`, `legacy` or `open`), also returned
+  by `GET /audit` as `token_kind` -- that is the field that tells a bound
+  identity from one the caller merely asserted in the header. Bound tokens always
+  resolve as a `GitHubIdentity`, so a service account must exist in the dataset
+  as a Person with that identifier (documented in `.env.example`). The new tests
+  run the real app and assert which external id the bridge *looked up*; each
+  fix has a mutation (binding disabled, legacy flag ignored, fallback restored,
+  startup check removed, audit field dropped) that fails them. Not covered here:
+  per-token rotation or expiry (tokens are static config, like `BEARER_TOKEN`).
+  [PR #51](https://github.com/kurtcagle/holon-bridge-python/pull/51)
 
 ### 2026-10-04
 
@@ -267,6 +298,12 @@ process:
 @prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix dcterms: <http://purl.org/dc/terms/> .
 @prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
+
+hb:release-2026-10-07-a a hb:ReleaseNote ;
+    dcterms:date "2026-10-07"^^xsd:date ;
+    rdfs:label "Identity-bound bearer tokens" ;
+    dcterms:description "Added IDENTITY_TOKENS, PROXY_TOKENS and ALLOW_LEGACY_BEARER. A token in IDENTITY_TOKENS is bound to one external identity and require_animus uses it instead of the x-holon-animus-id header (a conflicting header is a 403); only PROXY_TOKENS may assert an identity via the header; the shared BEARER_TOKEN keeps its old behaviour unless ALLOW_LEGACY_BEARER is false. Previously whoever held the shared token could claim any identity, including admin." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/51> .
 
 hb:release-2026-09-27-a a hb:ReleaseNote ;
     dcterms:date "2026-09-27"^^xsd:date ;

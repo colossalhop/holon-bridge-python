@@ -461,8 +461,20 @@ def is_mutation(method: str, route_path: str) -> bool:
     return method.upper() in _MUTATING_METHODS and route_path not in READ_ONLY_POSTS
 
 
-def outcome_for(status_code: int) -> str:
+# Statuses that are a refusal only on one particular route. A 409 is not a
+# refusal in general (it can be a plain write conflict), but on the claim route
+# it means "you asked to own a dataset that already has an owner": a request
+# the bridge declined, which belongs in the same record as a 401/403 and must
+# survive the ``denials`` level.
+_ROUTE_REFUSALS: dict[str, frozenset[int]] = {
+    "/admin/dataset/initialise": frozenset({409}),
+}
+
+
+def outcome_for(status_code: int, route_path: str | None = None) -> str:
     if status_code in (401, 403):
+        return "denied"
+    if route_path is not None and status_code in _ROUTE_REFUSALS.get(route_path, ()):
         return "denied"
     if status_code >= 500:
         return "error"
@@ -614,7 +626,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
                 return
             route = request.scope.get("route")
             template = getattr(route, "path", None) or request.url.path
-            outcome = outcome_for(status_code)
+            outcome = outcome_for(status_code, template)
             mutation = is_mutation(request.method, template)
             if template.startswith(_UNRECORDED_PREFIXES) and outcome != "denied" and not mutation:
                 return

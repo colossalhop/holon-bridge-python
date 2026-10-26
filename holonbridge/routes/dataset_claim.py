@@ -61,6 +61,11 @@ async def initialise_dataset(
     Refused with 409 if the dataset already has an owner or admin. Creates the
     dataset's Home if it has none. Confirm with the person you are acting for
     before calling it.
+
+    Refusals: 403 for an ineligible caller (the same answer whether or not the
+    dataset is open); 404 ``unknown_dataset`` if the backend does not host it;
+    409 ``dataset_already_claimed`` if it already has an owner or admin. The 409
+    is audited as a refusal, like a 401/403.
     """
     who = claimant(
         settings,
@@ -77,6 +82,8 @@ async def initialise_dataset(
     try:
         result = await claim(client, conn, who, slug=body.slug, full_name=body.full_name)
     except ClaimError as exc:
+        # A 409 here is recorded as a refusal (audit.outcome_for); say why.
+        audit.annotate(reason=exc.code)
         raise HTTPException(exc.status, detail={"code": exc.code, "message": exc.message}) from exc
 
     audit.annotate(

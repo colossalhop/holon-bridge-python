@@ -9,7 +9,10 @@ not) WRITTEN to the store, not only on the status code:
 - a dataset that already has an owner or admin cannot be claimed;
 - the check and the grant are one update, so a second claim cannot also win;
 - the claimer is always the caller;
-- the typed ``dataset_unclaimed`` error is shown only to a caller who could act on it.
+- the typed ``dataset_unclaimed`` error is shown only to a caller who could act on it;
+- a dataset the backend does not host is a 404 -- but only to a caller who passed the
+  eligibility check, so the route still cannot be used to ask which datasets exist;
+- a refused claim (409) is audited as a refusal, not as an allowed request.
 
 The backing store is the rdflib-backed ``GraphStoreStub`` from the identity-admin
 tests, so the claim's SPARQL actually runs.
@@ -25,10 +28,28 @@ from holonbridge import claim as claim_mod
 from holonbridge.audit import audit_graph
 from holonbridge.config import Settings
 from holonbridge.conn import Conn
+from holonbridge.fuseki import FusekiError
 from holonbridge.persona_state import PersonaStore
 from holonbridge.server import create_app
 
 from .test_identity_admin import GraphStoreStub
+
+
+class HostingStub(GraphStoreStub):
+    """A store that also answers "which datasets do you host?" (the shared stub says none).
+
+    ``admin_api=False`` models Fuseki's ``/$/datasets`` being off or unreachable.
+    """
+
+    def __init__(self, hosted: tuple[str, ...] = ("example",), *, admin_api: bool = True) -> None:
+        super().__init__()
+        self.hosted = hosted
+        self.admin_api = admin_api
+
+    async def list_datasets(self, conn):
+        if not self.admin_api:
+            raise FusekiError(404, "no admin api", endpoint="/$/datasets")
+        return [{"name": name, "state": True, "services": []} for name in self.hosted]
 
 HOLON = "https://w3id.org/holon/"
 HOLONS = "urn:example:holons"
@@ -54,8 +75,8 @@ def _client(settings: Settings, stub: GraphStoreStub, tmp_path):
 
 
 @pytest.fixture
-def stub() -> GraphStoreStub:
-    return GraphStoreStub()
+def stub() -> HostingStub:
+    return HostingStub()
 
 
 @pytest.fixture
@@ -271,6 +292,58 @@ def test_a_successful_claim_is_audited(make, stub):
     text = entries.serialize(format="turtle")
     assert "/admin/dataset/initialise" in text
     assert "identity" in text  # the token kind is recorded
+
+
+def test_a_refused_claim_is_audited_as_denied(make, stub):
+    """409 is not a refusal everywhere, but here it is: the bridge declined the request."""
+    stub.ds.get_context(URIRef(HOLONS)).add((URIRef("urn:example:person:someone"), HAS_ROLE, OWNER_ROLE))
+    c = make(identity_tokens={ALICE_TOKEN: "alice"})
+
+    r = c.post("/admin/dataset/initialise", json={}, headers=bearer(ALICE_TOKEN))
+
+    assert r.status_code == 409
+    text = stub.ds.get_context(URIRef(audit_graph(HOLONS))).serialize(format="turtle")
+    assert "/admin/dataset/initialise" in text
+    assert '"denied"' in text
+    assert '"allowed"' not in text
+    assert "dataset_already_claimed" in text  # the reason is on the entry
+
+
+# --- a dataset that does not exist -----------------------------------------------------
+
+
+def test_an_unhosted_dataset_is_a_404_not_a_server_fault(make, stub):
+    stub.hosted = ("somewhere-else",)
+    c = make(identity_tokens={ALICE_TOKEN: "alice"})
+
+    r = c.post("/admin/dataset/initialise", json={}, headers=bearer(ALICE_TOKEN))
+
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "unknown_dataset"
+    assert "example" in r.json()["detail"]["message"]
+    assert written(stub) == 0
+
+
+def test_an_ineligible_caller_gets_the_403_even_for_a_dataset_that_does_not_exist(make, stub):
+    """The 404 must not become a way to ask which datasets exist."""
+    stub.hosted = ()
+    c = make(identity_tokens={MALLORY_TOKEN: "mallory"})
+
+    r = c.post("/admin/dataset/initialise", json={}, headers=bearer(MALLORY_TOKEN))
+
+    assert r.status_code == 403
+    assert written(stub) == 0
+
+
+def test_when_the_backend_cannot_list_datasets_the_claim_proceeds_as_before(make, stub):
+    """No admin API is not evidence the dataset is missing, so it is not turned into a 404."""
+    stub.admin_api = False
+    c = make(identity_tokens={ALICE_TOKEN: "alice"})
+
+    r = c.post("/admin/dataset/initialise", json={}, headers=bearer(ALICE_TOKEN))
+
+    assert r.status_code == 200, r.text
+    assert roles(stub) == {("urn:example:person:alice", str(OWNER_ROLE))}
 
 
 # --- the typed error -------------------------------------------------------------------

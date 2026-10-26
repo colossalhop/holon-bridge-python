@@ -40,7 +40,7 @@ from typing import Any
 from .acl import _admin_role, _owner_role
 from .config import Settings
 from .conn import Conn
-from .fuseki import FusekiClient
+from .fuseki import FusekiClient, FusekiError
 from .turtle import escape_literal
 
 HOLON = "https://w3id.org/holon/"
@@ -187,6 +187,20 @@ WHERE {{
 }}"""
 
 
+async def is_hosted(client: FusekiClient, conn: Conn) -> bool | None:
+    """Whether the backend hosts ``conn.dataset``; ``None`` when it cannot say.
+
+    ``None`` is the admin API being off or unreachable, which is not evidence
+    the dataset is missing, so the caller proceeds as it did before this check
+    existed rather than inventing a 404.
+    """
+    try:
+        datasets = await client.list_datasets(conn)
+    except FusekiError:
+        return None
+    return any(d.get("name") == conn.dataset for d in datasets)
+
+
 async def claim(
     client: FusekiClient,
     conn: Conn,
@@ -199,6 +213,18 @@ async def claim(
 
     async def query_fn(q: str) -> dict[str, Any]:
         return await client.select(conn, q)
+
+    # A dataset that does not exist is not an unclaimed one: without this the
+    # first ASK against it surfaces as an opaque backend error, and a typo in
+    # the name looks like a server fault. Runs only for an already-eligible
+    # caller (the route checks that first), so it tells nobody anything new.
+    if await is_hosted(client, conn) is False:
+        raise ClaimError(
+            404,
+            "unknown_dataset",
+            f"dataset {conn.dataset!r} does not exist on this server; the bridge does not "
+            "create datasets, so create it in Fuseki first",
+        )
 
     if not await is_unclaimed(query_fn, conn.holons_graph):
         raise ClaimError(

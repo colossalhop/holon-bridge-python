@@ -506,6 +506,15 @@ async def update_fluent(
 
     shapes_turtle = await client.get_graph(conn, conn.shapes_graph)
     gated = bool(shapes_turtle.strip())
+    if gated:
+        # The pre-commit check below validates through the client directly, so
+        # it does not pass through shacl.validate_full/validate_delta where this
+        # guard normally lives. Without it a SPARQLConstraint that references
+        # GRAPH silently conforms here (issue #2) and the gate is armed in name only.
+        try:
+            shacl_mod.ensure_enforceable(shapes_turtle)
+        except ValueError as exc:
+            raise FluentError(str(exc)) from exc
 
     for _ in range(attempts):
         current, current_assertion = await _read_current(client, conn, fluent=fluent)

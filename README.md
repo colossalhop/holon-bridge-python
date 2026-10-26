@@ -369,6 +369,27 @@ payload in isolation is a different question and will flag cross-references
 the target graph would have satisfied. `/validate` with `mode=auto` picks
 delta whenever a target is supplied.
 
+**Writing a constraint that is "one per graph".** Delta mode validates the
+target graph as one flat graph, so a SPARQLConstraint should be written
+against that graph and not reach for `GRAPH ?g`:
+
+```sparql
+SELECT $this ?other
+WHERE { ?other a holon:Home . FILTER (?other != $this) }
+```
+
+This enforces "at most one `holon:Home` in the graph being written to" — the
+usual per-persona or per-user singleton — and it is what a write is checked
+against. Homes in other graphs do not conflict, which is deliberate. A
+constraint that genuinely spans graphs (uniqueness across the whole dataset,
+say) cannot be enforced by Jena's SHACL service, so a shapes graph containing
+a `GRAPH` inside any `sh:select` or `sh:ask` is refused outright, with the
+offending shape named, on every gated path: `push_turtle`, `/validate`,
+pipeline and scheduler validation, and fluent transitions. The check is a
+keyword scan, so it also fires on a deactivated shape, or one that only
+mentions `GRAPH` in a comment. See
+[#2](https://github.com/kurtcagle/holon-bridge-python/issues/2).
+
 **Three bugs found live against real shapes, none reachable from the unit
 suite, all fixed.** Worth stating plainly rather than folding quietly into
 the design description above, because each one changed what "the gate is

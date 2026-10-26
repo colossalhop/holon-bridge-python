@@ -845,6 +845,57 @@ nothing — plenty of setups supply real environment variables directly and
 have no file at all — but an explicit path is a promise, and a broken one
 should say so immediately.
 
+### Credentials: one token, one role, and claiming a dataset
+
+A token to the REST bridge is exactly one of three kinds, and the bridge refuses
+to start if one string is configured as two of them:
+
+| Kind | Configured as | What presenting it means |
+|---|---|---|
+| legacy | `BEARER_TOKEN` | Shared secret. The caller names any identity in the `x-holon-animus-id` header, so the header proves nothing. |
+| identity | `IDENTITY_TOKENS=token=name,…` | The token *is* that identity; a header naming anyone else is a 403. |
+| proxy | `PROXY_TOKENS=token,…` | A trusted proxy (the MCP remote, after OAuth) that has verified the caller and asserts the identity in the header. |
+
+Startup also refuses `ALLOW_LEGACY_BEARER=false` when no identity or proxy token
+is configured, since no credential could then authenticate. Identity and proxy
+tokens must be at least 24 characters.
+
+The MCP is a proxy, so it cannot present the `BEARER_TOKEN`. It reads its own
+token from `HOLONBRIDGE_MCP_TOKEN`, and falls back to `BEARER_TOKEN` only when
+that is unset or blank — an existing single-token setup is unchanged. A blank
+`BEARER_TOKEN=` in the shared `.env` (the REST side, once it has moved to
+proxy/identity tokens) does not hide the MCP's own token.
+Remember that a real environment variable beats the file: a machine-level
+`BEARER_TOKEN` outranks a blank one in `.env`, so delete it from the
+environment instead. With no token at all the MCP sends no `Authorization`
+header, which is correct for an open loopback bridge and otherwise a 401
+`missing bearer token`; it logs which variable it used (never the value) at
+startup, or a warning when there is none.
+
+**Claiming a dataset.** A dataset that exists in Fuseki but has no owner or
+admin answers every gated route with 401, because there is no Person who could
+authorise anything. `holonbridge-bootstrap-admin` is the operator-side way in;
+`DATASET_CLAIMANTS` is the in-band one. It is a comma-separated list of
+identifiers; empty (the default) turns the in-band claim off.
+
+- A caller may `POST /admin/dataset/initialise` (MCP tool `initialise_dataset`)
+  only if its identity is *established* — an identity token, or a proxy
+  asserting one — **and** is on the list. The legacy token and an open
+  deployment never qualify. The caller becomes the owner; nothing names anyone
+  else.
+- Such a caller who calls a gated route on an open dataset gets a typed
+  `401 dataset_unclaimed` with the remedy. It is a prompt to ask the person, not
+  permission. Anyone else gets the plain 401, so this cannot be used to ask
+  which datasets are open.
+- Refusals: **403** for an ineligible caller (the same whether or not the
+  dataset is open); **404 `unknown_dataset`** when the server does not host the
+  dataset (the bridge never creates one; checked after eligibility, so it does
+  not reveal which datasets exist); **409 `dataset_already_claimed`** when it
+  already has an owner or admin. The 409 is audited as a refusal, with its
+  reason, so it survives the `denials` audit level. If Fuseki's
+  `/$/datasets` admin API is unavailable the 404 check is skipped rather than
+  guessed.
+
 ---
 
 ## MCP layer

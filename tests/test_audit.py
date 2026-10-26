@@ -545,3 +545,32 @@ def test_build_entry_writes_the_kind_as_a_literal_that_cannot_alter_the_statemen
     subject = URIRef("urn:example:e1")
     assert [str(o) for o in g.objects(subject, HB.outcome)] == ["allowed"]  # not forged
     assert list(g.objects(subject, HB.tokenKind)) == [Literal(hostile)]
+
+
+# --- what counts as a refusal ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "route", "expected"),
+    [
+        (401, "/holon", "denied"),
+        (403, "/admin/persons", "denied"),
+        (200, "/admin/dataset/initialise", "allowed"),
+        (500, "/admin/dataset/initialise", "error"),
+        # A 409 is a refusal on the claim route only: elsewhere it is an
+        # ordinary conflict and must not be reclassified.
+        (409, "/admin/dataset/initialise", "denied"),
+        (409, "/holon", "allowed"),
+        (409, None, "allowed"),
+        # The claim route's other statuses are not refusals.
+        (404, "/admin/dataset/initialise", "allowed"),
+        (400, "/admin/dataset/initialise", "allowed"),
+    ],
+)
+def test_outcome_for_treats_a_claim_conflict_as_a_refusal(status, route, expected):
+    assert audit.outcome_for(status, route) == expected
+
+
+def test_outcome_for_keeps_its_one_argument_form():
+    assert audit.outcome_for(401) == "denied"
+    assert audit.outcome_for(409) == "allowed"

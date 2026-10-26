@@ -50,6 +50,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +66,41 @@ log = logging.getLogger("holonbridge_mcp.server")
 load_shared_env()
 
 BRIDGE_URL = os.getenv("HOLONBRIDGE_URL", "http://localhost:3031").rstrip("/")
-BEARER = os.getenv("BEARER_TOKEN", "")
+
+# Variables the MCP process may take its credential for the REST bridge from,
+# in order. HOLONBRIDGE_MCP_TOKEN is the MCP's *own* token: once the bridge
+# gives the MCP a PROXY_TOKENS entry it must differ from BEARER_TOKEN (one
+# token, one role -- see holonbridge.config.Settings), and BEARER_TOKEN is also
+# what the REST process reads, so the two processes cannot share one variable.
+# BEARER_TOKEN stays as the fallback so every existing setup keeps working.
+MCP_TOKEN_VARS = ("HOLONBRIDGE_MCP_TOKEN", "BEARER_TOKEN")
+
+
+def resolve_mcp_token(environ: Mapping[str, str] | None = None) -> tuple[str, str | None]:
+    """``(token, variable it came from)``, or ``("", None)`` when none is set.
+
+    A variable that is set but blank counts as unset -- a shared ``.env`` that
+    carries ``BEARER_TOKEN=`` for the REST process must not mask the MCP's own
+    token, nor stop the fallback from reaching it.
+    """
+    env = os.environ if environ is None else environ
+    for name in MCP_TOKEN_VARS:
+        value = (env.get(name) or "").strip()
+        if value:
+            return value, name
+    return "", None
+
+
+BEARER, BEARER_SOURCE = resolve_mcp_token()
+if BEARER_SOURCE:
+    # The name only, never the value.
+    log.info("authenticating to the bridge with the token from %s", BEARER_SOURCE)
+else:
+    log.warning(
+        "no %s set: calls to the bridge carry no Authorization header (fine for an "
+        "open loopback bridge; otherwise every call is a 401 'missing bearer token')",
+        " or ".join(MCP_TOKEN_VARS),
+    )
 
 
 def _safe_filename_component(login: str) -> str:

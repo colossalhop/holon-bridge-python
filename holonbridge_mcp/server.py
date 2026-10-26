@@ -11,7 +11,9 @@ Run::
 
 Environment:
     HOLONBRIDGE_URL      default http://localhost:3031
-    BEARER_TOKEN         bearer token for the bridge
+    HOLONBRIDGE_MCP_TOKEN  this process's own bearer token for the bridge
+                         (a PROXY_TOKENS entry on the bridge side)
+    BEARER_TOKEN         fallback when HOLONBRIDGE_MCP_TOKEN is unset or blank
     HOLONBRIDGE_DATASET  optional X-Dataset-Override applied to every call
     HOLONBRIDGE_BANK     optional bank (named backend connection) for every call
     ANTHROPIC_API_KEY    required for nl_query

@@ -2,9 +2,9 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.11
+version: 1.0.12
 created: 2026-09-27
-updated: 2026-10-07
+updated: 2026-10-25
 author:
   - name: Kurt Cagle
     iri: https://holongraph.com/people/kurt-cagle
@@ -45,6 +45,31 @@ process:
    not needed yet.
 
 ## Log
+
+### 2026-10-25
+
+- **Owner role, and an in-band, allowlisted dataset claim.**
+  A new reserved `owner` role sits above `admin`: owner implies admin (every
+  admin check passes for one), and once a dataset has an owner **only an owner
+  may grant, revoke or deactivate `admin` or `owner`** -- an admin keeps every
+  other power. This is a behaviour change: before, any admin could create or
+  remove any other admin. A dataset with no owner behaves as before, and
+  `owner` is never grantable by a non-owner. The last owner cannot be removed;
+  ownership moves by granting a second owner and revoking the first. The gate
+  checks the real caller, so an admin cannot climb by `act_as`-ing the owner.
+  New `POST /admin/dataset/initialise` (MCP tool `initialise_dataset`) makes
+  the caller the first owner of a dataset with no owner or admin, and creates
+  its Home if absent. Only an identity-bound token, or a trusted proxy's
+  asserted identity, that is also listed in the new `DATASET_CLAIMANTS` setting
+  may use it; a legacy shared token or an open deployment never can, and an
+  empty list (the default) turns it off. The check and the grant are one SPARQL
+  update, so two concurrent claims cannot both win, and the claim is always
+  audited. A caller with no Person on an unclaimed dataset now gets
+  `code: dataset_unclaimed` (a cue for the client to ask the person), but only
+  if they could act on it. `holonbridge-bootstrap-admin` and the start scripts
+  now default to `--role owner`; the new `--grant-existing` flag gives a dataset
+  that predates the owner role its first owner. Closes #57
+  ([#58](https://github.com/kurtcagle/holon-bridge-python/pull/58)).
 
 ### 2026-10-07
 
@@ -298,6 +323,12 @@ process:
 @prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix dcterms: <http://purl.org/dc/terms/> .
 @prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
+
+hb:release-2026-10-25-a a hb:ReleaseNote ;
+    dcterms:date "2026-10-25"^^xsd:date ;
+    rdfs:label "Owner role and allowlisted dataset claim" ;
+    dcterms:description "Added a reserved owner role above admin (owner implies admin; once an owner exists only an owner may grant, revoke or deactivate admin or owner) and POST /admin/dataset/initialise, which makes an allowlisted, identity-established caller the first owner of a dataset with no owner or admin. New setting DATASET_CLAIMANTS; empty by default, which disables the in-band claim. Legacy shared tokens and open deployments can never claim. A caller with no Person on an unclaimed dataset gets a typed dataset_unclaimed error, shown only if they could act on it. holonbridge-bootstrap-admin now defaults to --role owner and gains --grant-existing." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/58> .
 
 hb:release-2026-10-07-a a hb:ReleaseNote ;
     dcterms:date "2026-10-07"^^xsd:date ;

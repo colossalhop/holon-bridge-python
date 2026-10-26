@@ -2,7 +2,7 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.13
+version: 1.0.14
 created: 2026-09-27
 updated: 2026-10-25
 author:
@@ -82,6 +82,27 @@ process:
   now default to `--role owner`; the new `--grant-existing` flag gives a dataset
   that predates the owner role its first owner. Closes #57
   ([#58](https://github.com/kurtcagle/holon-bridge-python/pull/58)).
+
+### 2026-10-21
+
+- **SHACL context: a `taxonomy` graph role, merged into the validation context beside the ontology.**
+  A shape that checks a value against a controlled vocabulary (`sh:class
+  skos:Concept`, concept-scheme membership, a `sh:node` into a concept shape)
+  has the same problem the context pack was built for: validated against the
+  data graph alone it cannot see the concept. Taxonomies get their own graph,
+  `urn:{dataset}:taxonomy`, rather than living in the ontology graph, because
+  they change at a different rate, are edited by different people, and should
+  be grantable, versionable and replaceable on their own.
+  `Conn.validation_context_graphs` is now `(ontology, taxonomy)`. Like the
+  ontology, the taxonomy is read-only context: `ADD`-ed to the scratch copy,
+  never written to, chosen by the dataset and never by a request.
+  **No behaviour change for a dataset with no taxonomy graph** (`ADD SILENT`
+  of an absent graph is a no-op), and the ordinary `shacl` graph is still
+  validated against the target alone. Cost to be aware of: every validated
+  write copies the context graphs into a scratch graph (twice in delta mode),
+  so a very large taxonomy makes writes slower; not measured here. Shapes that
+  need the taxonomy belong in `shacl-context`.
+  ([#54](https://github.com/kurtcagle/holon-bridge-python/pull/54))
 
 ### 2026-10-07
 
@@ -347,6 +368,12 @@ hb:release-2026-10-25-a a hb:ReleaseNote ;
     rdfs:label "Owner role and allowlisted dataset claim" ;
     dcterms:description "Added a reserved owner role above admin (owner implies admin; once an owner exists only an owner may grant, revoke or deactivate admin or owner) and POST /admin/dataset/initialise, which makes an allowlisted, identity-established caller the first owner of a dataset with no owner or admin. New setting DATASET_CLAIMANTS; empty by default, which disables the in-band claim. Legacy shared tokens and open deployments can never claim. A caller with no Person on an unclaimed dataset gets a typed dataset_unclaimed error, shown only if they could act on it. holonbridge-bootstrap-admin now defaults to --role owner and gains --grant-existing." ;
     rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/58> .
+
+hb:release-2026-10-21-a a hb:ReleaseNote ;
+    dcterms:date "2026-10-21"^^xsd:date ;
+    rdfs:label "SHACL context: a taxonomy graph role, merged into the validation context beside the ontology" ;
+    dcterms:description "New graph role taxonomy (urn:{dataset}:taxonomy) for controlled vocabularies, kept apart from the ontology so they can be granted, versioned and replaced independently. Conn.validation_context_graphs is now (ontology, taxonomy), so shapes in shacl-context that check a value against a concept can see the concept. The taxonomy is read-only context, added to the scratch copy with ADD SILENT and never written to, chosen by the dataset and never by a request. A dataset with no taxonomy graph behaves exactly as before. Every validated write now copies the context graphs into a scratch graph (twice in delta mode), so a very large taxonomy will slow writes; not measured. Tested with the existing fake client, not a live Fuseki run." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/54> .
 
 hb:release-2026-10-07-a a hb:ReleaseNote ;
     dcterms:date "2026-10-07"^^xsd:date ;

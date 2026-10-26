@@ -2,7 +2,7 @@
 id: https://w3id.org/databook/holon-bridge-python-whats-new
 title: "What's New — holon-bridge-python"
 type: databook
-version: 1.0.12
+version: 1.0.13
 created: 2026-09-27
 updated: 2026-10-25
 author:
@@ -47,6 +47,18 @@ process:
 ## Log
 
 ### 2026-10-25
+
+- **Fluent transitions now refuse a shapes graph with a graph-crossing constraint.**
+  The guard from issue #2 (a `sh:select`/`sh:ask` that references `GRAPH` is
+  refused, because Jena validates one flat graph and would silently conform)
+  covered `push_turtle`, `/validate`, the pipeline stage and the scheduler, but
+  not the fluent pre-commit check, which validates through the client directly.
+  On a gated dataset such a constraint passed every fluent transition silently;
+  `update_fluent` now raises a `FluentError` naming the shape. The README
+  documents the flat form for a per-graph singleton constraint, which is what
+  the original use case needed. Follow-on for constraints that genuinely span
+  graphs: #60
+  ([#59](https://github.com/kurtcagle/holon-bridge-python/pull/59)).
 
 - **Owner role, and an in-band, allowlisted dataset claim.**
   A new reserved `owner` role sits above `admin`: owner implies admin (every
@@ -323,6 +335,12 @@ process:
 @prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix dcterms: <http://purl.org/dc/terms/> .
 @prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
+
+hb:release-2026-10-25-b a hb:ReleaseNote ;
+    dcterms:date "2026-10-25"^^xsd:date ;
+    rdfs:label "Fluent gate applies the graph-crossing SHACL guard" ;
+    dcterms:description "The fluent pre-commit check validates through the client directly and so skipped the guard that refuses a SPARQLConstraint referencing GRAPH. On a gated dataset such a constraint silently passed every fluent transition; update_fluent now raises a FluentError naming the shape. Documented the flat form for a per-graph singleton constraint. Constraints that genuinely span graphs remain unenforceable, tracked in #60." ;
+    rdfs:seeAlso <https://github.com/kurtcagle/holon-bridge-python/pull/59> .
 
 hb:release-2026-10-25-a a hb:ReleaseNote ;
     dcterms:date "2026-10-25"^^xsd:date ;
